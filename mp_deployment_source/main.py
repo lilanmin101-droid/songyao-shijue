@@ -44,10 +44,10 @@ ARRIVE_BOX_HEIGHT_RATIO = 0.35
 # Calibrate it on your car. Example: at 1000 mm, box height is 90 px -> K = 90000.
 DISTANCE_K_BY_HEIGHT = 90000
 
-# Line tracking. This uses bottom ROIs and black-line blob centers.
+# Line tracking. This uses bottom ROIs and red-line blob centers.
 ENABLE_LINE_TRACK = True
 LINE_DETECT_EVERY_N_FRAMES = 1
-LINE_THRESHOLDS = [(0, 45, -25, 25, -25, 25)]
+LINE_THRESHOLDS = [(20, 100, 25, 127, -10, 127)]
 LINE_MIN_PIXELS = 80
 LINE_MIN_AREA = 80
 LINE_ROI_BANDS = [
