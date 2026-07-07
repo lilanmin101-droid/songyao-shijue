@@ -5,6 +5,7 @@ import time
 from libs.PlatTasks import DetectionApp
 from libs.PipeLine import PipeLine
 from libs.Utils import *
+from media.sensor import *
 
 
 # =========================
@@ -46,14 +47,23 @@ DISTANCE_K_BY_HEIGHT = 90000
 
 # Line tracking. This uses bottom ROIs and red-line blob centers.
 ENABLE_LINE_TRACK = True
+LINE_USE_RGB565_CHN1 = False
+LINE_USE_RAW_RGB_SCAN = True
+LINE_RGB565_SIZE = [640, 360]
 LINE_DETECT_EVERY_N_FRAMES = 1
-LINE_THRESHOLDS = [(20, 100, 25, 127, -10, 127)]
-LINE_MIN_PIXELS = 80
-LINE_MIN_AREA = 80
+LINE_THRESHOLDS = [(10, 100, 10, 127, -30, 127)]
+LINE_MIN_PIXELS = 40
+LINE_MIN_AREA = 40
+LINE_SCAN_STEP_X = 4
+LINE_SCAN_STEP_Y = 3
+LINE_RED_MIN = 90
+LINE_RED_DOMINANCE = 25
+LINE_RED_RATIO_NUM = 5
+LINE_RED_RATIO_DEN = 4
 LINE_ROI_BANDS = [
-    (0.58, 0.13, 1.0),
-    (0.72, 0.12, 1.8),
-    (0.84, 0.12, 2.8),
+    (0.50, 0.15, 1.0),
+    (0.66, 0.14, 1.8),
+    (0.82, 0.14, 2.8),
 ]
 LINE_SMOOTH_ALPHA = 0.65
 LINE_LOST_RESET_FRAMES = 5
@@ -85,6 +95,8 @@ COLOR_TEXT = (255, 255, 255, 255)
 COLOR_WARN = (255, 255, 220, 0)
 COLOR_LINE = (255, 40, 220, 40)
 COLOR_LINE_ROI = (120, 255, 255, 0)
+
+line_rgb565_chn1_ready = False
 
 
 def join_path(root, name):
@@ -123,6 +135,32 @@ def flatten_anchors(deploy_conf, model_type):
             for item in group:
                 anchors.append(item)
     return anchors
+
+
+def config_line_sensor_channel(pl):
+    global line_rgb565_chn1_ready
+    line_rgb565_chn1_ready = False
+    if not ENABLE_LINE_TRACK or not LINE_USE_RGB565_CHN1:
+        return
+    try:
+        pl.sensor.set_framesize(w=LINE_RGB565_SIZE[0], h=LINE_RGB565_SIZE[1], chn=CAM_CHN_ID_1)
+        pl.sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
+        line_rgb565_chn1_ready = True
+        print("Line RGB565 channel ready:", LINE_RGB565_SIZE)
+    except Exception as e:
+        print("Line RGB565 channel setup failed:", e)
+
+
+def get_line_frame(pl):
+    if not ENABLE_LINE_TRACK:
+        return None
+    if LINE_USE_RGB565_CHN1 and line_rgb565_chn1_ready:
+        try:
+            return pl.sensor.snapshot(chn=CAM_CHN_ID_1)
+        except Exception as e:
+            print("line snapshot chn1 failed:", e)
+            return None
+    return pl.cur_frame
 
 
 def label_to_id(label):
@@ -245,6 +283,8 @@ class LineTracker:
             "area": 0,
             "points": [],
             "rois": self.rois,
+            "frame_w": self.frame_w,
+            "frame_h": self.frame_h,
         }
 
     def _build_rois(self):
@@ -280,7 +320,10 @@ class LineTracker:
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
-            blob = self._find_best_blob(img_obj, rect)
+            if LINE_USE_RAW_RGB_SCAN:
+                blob = self._scan_red_blob(img_obj, rect)
+            else:
+                blob = self._find_best_blob(img_obj, rect)
             if blob is None:
                 continue
             x, y, w, h = self._blob_rect(blob)
@@ -319,9 +362,100 @@ class LineTracker:
             "area": sum_area,
             "points": points,
             "rois": self.rois,
+            "frame_w": self.frame_w,
+            "frame_h": self.frame_h,
         }
         self.last = self._smooth(result)
         return self.last
+
+    def _scan_red_blob(self, img_obj, rect):
+        x0, y0, rw, rh = rect
+        x1 = x0 + rw
+        y1 = y0 + rh
+        count = 0
+        sum_x = 0
+        sum_y = 0
+        min_x = x1
+        min_y = y1
+        max_x = x0
+        max_y = y0
+
+        for y in range(y0, y1, LINE_SCAN_STEP_Y):
+            for x in range(x0, x1, LINE_SCAN_STEP_X):
+                pixel = self._get_rgb_pixel(img_obj, x, y)
+                if pixel is None:
+                    return None
+                r, g, b = pixel
+                if self._is_red_pixel(r, g, b):
+                    count += 1
+                    sum_x += x
+                    sum_y += y
+                    if x < min_x:
+                        min_x = x
+                    if y < min_y:
+                        min_y = y
+                    if x > max_x:
+                        max_x = x
+                    if y > max_y:
+                        max_y = y
+
+        if count < LINE_MIN_PIXELS:
+            return None
+
+        cx = int(sum_x / count)
+        cy = int(sum_y / count)
+        w = max_x - min_x + LINE_SCAN_STEP_X
+        h = max_y - min_y + LINE_SCAN_STEP_Y
+        area = count * LINE_SCAN_STEP_X * LINE_SCAN_STEP_Y
+        if area < LINE_MIN_AREA:
+            return None
+        return (cx - w // 2, cy - h // 2, w, h, area)
+
+    def _get_rgb_pixel(self, img_obj, x, y):
+        try:
+            shape = img_obj.shape
+            if len(shape) == 3 and shape[0] == 3:
+                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
+            if len(shape) == 3 and shape[2] == 3:
+                value = img_obj[y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            pass
+
+        try:
+            value = img_obj[y][x]
+        except Exception:
+            try:
+                value = img_obj.get_pixel(x, y)
+            except Exception as e:
+                self._disable(e)
+                return None
+
+        try:
+            if len(value) >= 3:
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            pass
+
+        try:
+            raw = int(value)
+            r = (raw >> 16) & 0xFF
+            g = (raw >> 8) & 0xFF
+            b = raw & 0xFF
+            return r, g, b
+        except Exception:
+            return None
+
+    def _is_red_pixel(self, r, g, b):
+        if r < LINE_RED_MIN:
+            return False
+        if r < g + LINE_RED_DOMINANCE:
+            return False
+        if r < b + LINE_RED_DOMINANCE:
+            return False
+        if r * LINE_RED_RATIO_DEN < g * LINE_RED_RATIO_NUM:
+            return False
+        return True
 
     def _find_best_blob(self, img_obj, rect):
         try:
@@ -360,12 +494,19 @@ class LineTracker:
             self.error_reported = True
 
     def _blob_rect(self, blob):
+        if len(blob) >= 5:
+            return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
         try:
             return int(blob.x()), int(blob.y()), int(blob.w()), int(blob.h())
         except Exception:
             return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
 
     def _blob_area(self, blob, w, h):
+        try:
+            if len(blob) >= 5:
+                return int(blob[4])
+        except Exception:
+            pass
         try:
             return int(blob.pixels())
         except Exception:
@@ -680,6 +821,12 @@ def build_line_payload(frame_id, line_result, fps):
     )
 
 
+def source_size_from_line(line_result):
+    if line_result is not None and "frame_w" in line_result and "frame_h" in line_result:
+        return line_result["frame_w"], line_result["frame_h"]
+    return RGB888P_SIZE[0], RGB888P_SIZE[1]
+
+
 def scaled_rect(candidate, display_size):
     dw = display_size[0]
     dh = display_size[1]
@@ -692,15 +839,19 @@ def scaled_rect(candidate, display_size):
     return x, y, w, h
 
 
-def scale_xy(x, y, display_size):
-    return int(x * display_size[0] // RGB888P_SIZE[0]), int(y * display_size[1] // RGB888P_SIZE[1])
+def scale_xy(x, y, display_size, source_size=None):
+    if source_size is None:
+        source_size = RGB888P_SIZE
+    return int(x * display_size[0] // source_size[0]), int(y * display_size[1] // source_size[1])
 
 
-def scale_rect_xywh(rect, display_size):
+def scale_rect_xywh(rect, display_size, source_size=None):
     x, y, w, h = rect
-    sx, sy = scale_xy(x, y, display_size)
-    sw = int(w * display_size[0] // RGB888P_SIZE[0])
-    sh = int(h * display_size[1] // RGB888P_SIZE[1])
+    if source_size is None:
+        source_size = RGB888P_SIZE
+    sx, sy = scale_xy(x, y, display_size, source_size)
+    sw = int(w * display_size[0] // source_size[0])
+    sh = int(h * display_size[1] // source_size[1])
     return sx, sy, sw, sh
 
 
@@ -725,22 +876,23 @@ def draw_candidate(draw_img, candidate, display_size, selected_id, locked):
 def draw_line_overlay(draw_img, line_result, display_size):
     if line_result is None:
         return
+    source_size = source_size_from_line(line_result)
 
     if DRAW_LINE_ROIS:
         for roi_def in line_result["rois"]:
-            x, y, w, h = scale_rect_xywh(roi_def["rect"], display_size)
+            x, y, w, h = scale_rect_xywh(roi_def["rect"], display_size, source_size)
             draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
 
     if not line_result["seen"]:
         draw_img.draw_string_advanced(8, display_size[1] - 30, 22, "LINE LOST", color=COLOR_WARN)
         return
 
-    lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size)
+    lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
     draw_img.draw_circle(lx, ly, 7, color=COLOR_LINE, fill=True)
     draw_img.draw_line(display_size[0] // 2, display_size[1], lx, ly, color=COLOR_LINE, thickness=3)
 
     for point in line_result["points"]:
-        px, py = scale_xy(point[0], point[1], display_size)
+        px, py = scale_xy(point[0], point[1], display_size, source_size)
         draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
 
     text = "LINE ex:%d ang:%d" % (line_result["err_x"], line_result["angle"])
@@ -814,10 +966,12 @@ def main():
     print("Model:", kmodel_path)
     print("Labels:", labels)
     print("Model type:", model_type)
+    print("Line mode:", "RAW_RGB_SCAN" if LINE_USE_RAW_RGB_SCAN else "find_blobs")
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
-    line_tracker = LineTracker(RGB888P_SIZE)
+    line_frame_size = LINE_RGB565_SIZE if LINE_USE_RGB565_CHN1 else RGB888P_SIZE
+    line_tracker = LineTracker(line_frame_size)
     fps_meter = FpsMeter()
     runtime_target = DEFAULT_TARGET_ID
     frame_id = 0
@@ -827,6 +981,7 @@ def main():
     try:
         pl = PipeLine(rgb888p_size=RGB888P_SIZE, display_mode=DISPLAY_MODE, display_size=DISPLAY_SIZE)
         pl.create(sensor_id=SENSOR_ID, hmirror=HMIRROR, vflip=VFLIP, fps=CAMERA_FPS)
+        config_line_sensor_channel(pl)
         display_size = pl.get_display_size()
 
         det_app = DetectionApp(
@@ -864,7 +1019,7 @@ def main():
                 res = det_app.run(img)
                 line_result = None
                 if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
-                    line_result = line_tracker.update(pl.cur_frame)
+                    line_result = line_tracker.update(img)
                 else:
                     line_result = line_tracker.last
 

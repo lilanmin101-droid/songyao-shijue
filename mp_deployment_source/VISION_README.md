@@ -32,6 +32,8 @@
 - `DISTANCE_K_BY_HEIGHT`：粗略距离估计系数，需要现场标定。
 - `ENABLE_LINE_TRACK`：是否启用循迹。
 - `LINE_THRESHOLDS`：循迹颜色阈值，默认是红线。
+- `LINE_USE_RAW_RGB_SCAN`：默认开启，直接扫描 AI 图像里的 RGB 红色像素，不依赖 `find_blobs`。
+- `LINE_RGB565_SIZE = [640, 360]`：只有关闭 RAW 扫描、改用 RGB565 通道时才使用。
 - `LINE_ROI_BANDS`：底部循迹区域和权重，越靠下权重越大。
 
 ## 下位机串口协议
@@ -71,7 +73,7 @@ $LN,frame,seen,err_x,angle,cx,width,area,fps*CS
 - `seen=1`：看到线。
 - `err_x`：线中心相对画面中心的横向误差，负数在左，正数在右。
 - `angle`：线方向角，负数偏左，正数偏右。
-- `cx`：融合后的线中心 x 坐标。
+- `cx`：融合后的线中心 x 坐标，默认基于 `RGB888P_SIZE`。
 - `width`：检测到的最大线宽。
 - `area`：多个 ROI 红线面积总和。
 
@@ -129,6 +131,6 @@ T0
 循迹调试建议：
 
 1. 先让画面底部看到红线，屏幕上会出现绿色 ROI、绿色线中心点和 `LINE ex/ang`。
-2. 如果一直 `LINE LOST`，优先把 `LINE_THRESHOLDS` 里的 A 通道下限从 `25` 降到 `15`。
-3. 如果把橙色/粉色干扰也识别成线，把 A 通道下限提高到 `35`，或者提高 `LINE_MIN_PIXELS`。
+2. 如果一直 `LINE LOST`，先把 `LINE_RED_MIN` 从 `90` 降到 `70`，再把 `LINE_RED_DOMINANCE` 从 `25` 降到 `15`。
+3. 如果把橙色/粉色干扰也识别成线，把 `LINE_RED_DOMINANCE` 提到 `35`，或者提高 `LINE_MIN_PIXELS`。
 4. 如果帧率不够，把 `RGB888P_SIZE` 改成 `[640, 360]`。
