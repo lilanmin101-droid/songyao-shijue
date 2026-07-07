@@ -5,7 +5,6 @@ import time
 from libs.PlatTasks import DetectionApp
 from libs.PipeLine import PipeLine
 from libs.Utils import *
-from media.sensor import *
 
 
 # =========================
@@ -47,23 +46,25 @@ DISTANCE_K_BY_HEIGHT = 90000
 
 # Line tracking. This uses bottom ROIs and red-line blob centers.
 ENABLE_LINE_TRACK = True
-LINE_USE_RGB565_CHN1 = False
 LINE_USE_RAW_RGB_SCAN = True
-LINE_RGB565_SIZE = [640, 360]
+LINE_TRY_FIND_BLOBS_FALLBACK = True
+LINE_FULL_FRAME_FALLBACK = True
+LINE_ACCEPT_BGR_RED = True
 LINE_DETECT_EVERY_N_FRAMES = 1
 LINE_THRESHOLDS = [(10, 100, 10, 127, -30, 127)]
-LINE_MIN_PIXELS = 40
-LINE_MIN_AREA = 40
+LINE_MIN_PIXELS = 20
+LINE_MIN_AREA = 20
 LINE_SCAN_STEP_X = 4
 LINE_SCAN_STEP_Y = 3
-LINE_RED_MIN = 90
-LINE_RED_DOMINANCE = 25
+LINE_RED_MIN = 70
+LINE_RED_DOMINANCE = 15
 LINE_RED_RATIO_NUM = 5
 LINE_RED_RATIO_DEN = 4
+LINE_FULL_FRAME_MIN_PIXELS = 40
 LINE_ROI_BANDS = [
-    (0.50, 0.15, 1.0),
-    (0.66, 0.14, 1.8),
-    (0.82, 0.14, 2.8),
+    (0.35, 0.18, 1.0),
+    (0.55, 0.18, 1.8),
+    (0.75, 0.20, 2.8),
 ]
 LINE_SMOOTH_ALPHA = 0.65
 LINE_LOST_RESET_FRAMES = 5
@@ -95,8 +96,6 @@ COLOR_TEXT = (255, 255, 255, 255)
 COLOR_WARN = (255, 255, 220, 0)
 COLOR_LINE = (255, 40, 220, 40)
 COLOR_LINE_ROI = (120, 255, 255, 0)
-
-line_rgb565_chn1_ready = False
 
 
 def join_path(root, name):
@@ -135,32 +134,6 @@ def flatten_anchors(deploy_conf, model_type):
             for item in group:
                 anchors.append(item)
     return anchors
-
-
-def config_line_sensor_channel(pl):
-    global line_rgb565_chn1_ready
-    line_rgb565_chn1_ready = False
-    if not ENABLE_LINE_TRACK or not LINE_USE_RGB565_CHN1:
-        return
-    try:
-        pl.sensor.set_framesize(w=LINE_RGB565_SIZE[0], h=LINE_RGB565_SIZE[1], chn=CAM_CHN_ID_1)
-        pl.sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_1)
-        line_rgb565_chn1_ready = True
-        print("Line RGB565 channel ready:", LINE_RGB565_SIZE)
-    except Exception as e:
-        print("Line RGB565 channel setup failed:", e)
-
-
-def get_line_frame(pl):
-    if not ENABLE_LINE_TRACK:
-        return None
-    if LINE_USE_RGB565_CHN1 and line_rgb565_chn1_ready:
-        try:
-            return pl.sensor.snapshot(chn=CAM_CHN_ID_1)
-        except Exception as e:
-            print("line snapshot chn1 failed:", e)
-            return None
-    return pl.cur_frame
 
 
 def label_to_id(label):
@@ -267,10 +240,13 @@ class LineTracker:
         self.frame_w = frame_size[0]
         self.frame_h = frame_size[1]
         self.rois = self._build_rois()
-        self.last = self._empty_result()
         self.lost_count = 0
         self.enabled = True
         self.error_reported = False
+        self.raw_error_reported = False
+        self.debug_red_pixels = 0
+        self.debug_scan_pixels = 0
+        self.last = self._empty_result()
 
     def _empty_result(self):
         return {
@@ -285,7 +261,49 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
+            "red_pixels": self.debug_red_pixels,
+            "scan_pixels": self.debug_scan_pixels,
         }
+
+    def _ensure_frame_size(self, img_obj):
+        size = self._infer_frame_size(img_obj)
+        if size is None:
+            return
+        w, h = size
+        if w <= 0 or h <= 0:
+            return
+        if w == self.frame_w and h == self.frame_h:
+            return
+        self.frame_w = w
+        self.frame_h = h
+        self.rois = self._build_rois()
+        print("Line frame size:", self.frame_w, self.frame_h)
+
+    def _infer_frame_size(self, img_obj):
+        try:
+            shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return int(shape[3]), int(shape[2])
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                return int(shape[2]), int(shape[1])
+            if len(shape) == 3 and shape[0] == 3:
+                return int(shape[2]), int(shape[1])
+            if len(shape) == 3 and shape[2] == 3:
+                return int(shape[1]), int(shape[0])
+            if len(shape) == 2:
+                return int(shape[1]), int(shape[0])
+        except Exception:
+            pass
+
+        try:
+            return int(img_obj.width()), int(img_obj.height())
+        except Exception:
+            pass
+
+        try:
+            return int(img_obj.width), int(img_obj.height)
+        except Exception:
+            return None
 
     def _build_rois(self):
         rois = []
@@ -310,20 +328,25 @@ class LineTracker:
             self.last = self._empty_result()
             return self.last
 
+        self._ensure_frame_size(img_obj)
         points = []
         total_weight = 0.0
         sum_x = 0.0
         sum_y = 0.0
         sum_area = 0
         max_width = 0
+        self.debug_red_pixels = 0
+        self.debug_scan_pixels = 0
 
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
             if LINE_USE_RAW_RGB_SCAN:
                 blob = self._scan_red_blob(img_obj, rect)
+                if blob is None and LINE_TRY_FIND_BLOBS_FALLBACK:
+                    blob = self._find_best_blob(img_obj, rect, False)
             else:
-                blob = self._find_best_blob(img_obj, rect)
+                blob = self._find_best_blob(img_obj, rect, True)
             if blob is None:
                 continue
             x, y, w, h = self._blob_rect(blob)
@@ -338,12 +361,29 @@ class LineTracker:
             if w > max_width:
                 max_width = w
 
+        if total_weight <= 0 and LINE_FULL_FRAME_FALLBACK:
+            full_rect = (0, 0, self.frame_w, self.frame_h)
+            blob = self._scan_red_blob(img_obj, full_rect, LINE_FULL_FRAME_MIN_PIXELS)
+            if blob is not None:
+                x, y, w, h = self._blob_rect(blob)
+                cx = x + w // 2
+                cy = y + h // 2
+                area = self._blob_area(blob, w, h)
+                points.append((cx, cy, w, h, area, full_rect))
+                sum_x = float(cx)
+                sum_y = float(cy)
+                total_weight = 1.0
+                sum_area = area
+                max_width = w
+
         if total_weight <= 0:
             self.lost_count += 1
             if self.lost_count >= LINE_LOST_RESET_FRAMES:
                 self.last = self._empty_result()
             else:
                 self.last["seen"] = 0
+                self.last["red_pixels"] = self.debug_red_pixels
+                self.last["scan_pixels"] = self.debug_scan_pixels
             return self.last
 
         self.lost_count = 0
@@ -364,11 +404,15 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
+            "red_pixels": self.debug_red_pixels,
+            "scan_pixels": self.debug_scan_pixels,
         }
         self.last = self._smooth(result)
         return self.last
 
-    def _scan_red_blob(self, img_obj, rect):
+    def _scan_red_blob(self, img_obj, rect, min_pixels=None):
+        if min_pixels is None:
+            min_pixels = LINE_MIN_PIXELS
         x0, y0, rw, rh = rect
         x1 = x0 + rw
         y1 = y0 + rh
@@ -386,7 +430,9 @@ class LineTracker:
                 if pixel is None:
                     return None
                 r, g, b = pixel
+                self.debug_scan_pixels += 1
                 if self._is_red_pixel(r, g, b):
+                    self.debug_red_pixels += 1
                     count += 1
                     sum_x += x
                     sum_y += y
@@ -399,7 +445,7 @@ class LineTracker:
                     if y > max_y:
                         max_y = y
 
-        if count < LINE_MIN_PIXELS:
+        if count < min_pixels:
             return None
 
         cx = int(sum_x / count)
@@ -414,6 +460,11 @@ class LineTracker:
     def _get_rgb_pixel(self, img_obj, x, y):
         try:
             shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                value = img_obj[0][y][x]
+                return int(value[0]), int(value[1]), int(value[2])
             if len(shape) == 3 and shape[0] == 3:
                 return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
             if len(shape) == 3 and shape[2] == 3:
@@ -427,8 +478,8 @@ class LineTracker:
         except Exception:
             try:
                 value = img_obj.get_pixel(x, y)
-            except Exception as e:
-                self._disable(e)
+            except Exception:
+                self._report_raw_scan_error()
                 return None
 
         try:
@@ -439,14 +490,31 @@ class LineTracker:
 
         try:
             raw = int(value)
-            r = (raw >> 16) & 0xFF
-            g = (raw >> 8) & 0xFF
-            b = raw & 0xFF
+            if raw <= 0xFFFF:
+                r = ((raw >> 11) & 0x1F) << 3
+                g = ((raw >> 5) & 0x3F) << 2
+                b = (raw & 0x1F) << 3
+            else:
+                r = (raw >> 16) & 0xFF
+                g = (raw >> 8) & 0xFF
+                b = raw & 0xFF
             return r, g, b
         except Exception:
             return None
 
+    def _report_raw_scan_error(self):
+        if not self.raw_error_reported:
+            print("line raw RGB scan unavailable, trying find_blobs fallback")
+            self.raw_error_reported = True
+
     def _is_red_pixel(self, r, g, b):
+        if self._is_red_order(r, g, b):
+            return True
+        if LINE_ACCEPT_BGR_RED and self._is_red_order(b, g, r):
+            return True
+        return False
+
+    def _is_red_order(self, r, g, b):
         if r < LINE_RED_MIN:
             return False
         if r < g + LINE_RED_DOMINANCE:
@@ -457,7 +525,7 @@ class LineTracker:
             return False
         return True
 
-    def _find_best_blob(self, img_obj, rect):
+    def _find_best_blob(self, img_obj, rect, disable_on_error=True):
         try:
             blobs = img_obj.find_blobs(
                 LINE_THRESHOLDS,
@@ -470,10 +538,16 @@ class LineTracker:
             try:
                 blobs = img_obj.find_blobs(LINE_THRESHOLDS, roi=rect, pixels_threshold=LINE_MIN_PIXELS)
             except Exception as e:
-                self._disable(e)
+                if disable_on_error:
+                    self._disable(e)
+                else:
+                    self._report_find_blobs_fallback_error()
                 return None
         except Exception as e:
-            self._disable(e)
+            if disable_on_error:
+                self._disable(e)
+            else:
+                self._report_find_blobs_fallback_error()
             return None
 
         best = None
@@ -493,9 +567,17 @@ class LineTracker:
             print("line find_blobs disabled:", error)
             self.error_reported = True
 
+    def _report_find_blobs_fallback_error(self):
+        if not self.error_reported:
+            print("line find_blobs fallback unavailable, keep raw RGB scan")
+            self.error_reported = True
+
     def _blob_rect(self, blob):
-        if len(blob) >= 5:
-            return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
+        try:
+            if len(blob) >= 5:
+                return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
+        except Exception:
+            pass
         try:
             return int(blob.x()), int(blob.y()), int(blob.w()), int(blob.h())
         except Exception:
@@ -884,7 +966,10 @@ def draw_line_overlay(draw_img, line_result, display_size):
             draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
 
     if not line_result["seen"]:
-        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, "LINE LOST", color=COLOR_WARN)
+        red_pixels = line_result.get("red_pixels", 0)
+        scan_pixels = line_result.get("scan_pixels", 0)
+        text = "LINE LOST r:%d/%d" % (red_pixels, scan_pixels)
+        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_WARN)
         return
 
     lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
@@ -895,7 +980,11 @@ def draw_line_overlay(draw_img, line_result, display_size):
         px, py = scale_xy(point[0], point[1], display_size, source_size)
         draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
 
-    text = "LINE ex:%d ang:%d" % (line_result["err_x"], line_result["angle"])
+    text = "LINE ex:%d ang:%d r:%d" % (
+        line_result["err_x"],
+        line_result["angle"],
+        line_result.get("red_pixels", 0),
+    )
     draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_LINE)
 
 
@@ -970,8 +1059,7 @@ def main():
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
-    line_frame_size = LINE_RGB565_SIZE if LINE_USE_RGB565_CHN1 else RGB888P_SIZE
-    line_tracker = LineTracker(line_frame_size)
+    line_tracker = LineTracker(RGB888P_SIZE)
     fps_meter = FpsMeter()
     runtime_target = DEFAULT_TARGET_ID
     frame_id = 0
@@ -981,7 +1069,6 @@ def main():
     try:
         pl = PipeLine(rgb888p_size=RGB888P_SIZE, display_mode=DISPLAY_MODE, display_size=DISPLAY_SIZE)
         pl.create(sensor_id=SENSOR_ID, hmirror=HMIRROR, vflip=VFLIP, fps=CAMERA_FPS)
-        config_line_sensor_channel(pl)
         display_size = pl.get_display_size()
 
         det_app = DetectionApp(
@@ -1016,12 +1103,12 @@ def main():
                 fps = fps_meter.update()
 
                 img = pl.get_frame()
-                res = det_app.run(img)
                 line_result = None
                 if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
                     line_result = line_tracker.update(img)
                 else:
                     line_result = line_tracker.last
+                res = det_app.run(img)
 
                 candidates = result_to_candidates(res, labels)
                 picked = pick_candidate(candidates, runtime_target)

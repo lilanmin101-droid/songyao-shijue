@@ -1,4 +1,4 @@
-# 2021 电赛送药小车 K230 视觉程序
+﻿# 2021 电赛送药小车 K230 视觉程序
 
 这个目录已经整理成 K230 可部署结构：
 
@@ -31,9 +31,8 @@
 - `ARRIVE_BOX_HEIGHT_RATIO`：判定到达药房的框高比例，越大越靠近才停车。
 - `DISTANCE_K_BY_HEIGHT`：粗略距离估计系数，需要现场标定。
 - `ENABLE_LINE_TRACK`：是否启用循迹。
-- `LINE_THRESHOLDS`：循迹颜色阈值，默认是红线。
-- `LINE_USE_RAW_RGB_SCAN`：默认开启，直接扫描 AI 图像里的 RGB 红色像素，不依赖 `find_blobs`。
-- `LINE_RGB565_SIZE = [640, 360]`：只有关闭 RAW 扫描、改用 RGB565 通道时才使用。
+- `LINE_USE_RAW_RGB_SCAN`：默认开启，直接扫描图像里的红色像素，避开部分 K230 图像对象不支持 `find_blobs` 的问题。
+- `LINE_RED_MIN` / `LINE_RED_DOMINANCE`：红线像素判定阈值，看不到线时优先调低。
 - `LINE_ROI_BANDS`：底部循迹区域和权重，越靠下权重越大。
 
 ## 下位机串口协议
@@ -131,6 +130,6 @@ T0
 循迹调试建议：
 
 1. 先让画面底部看到红线，屏幕上会出现绿色 ROI、绿色线中心点和 `LINE ex/ang`。
-2. 如果一直 `LINE LOST`，先把 `LINE_RED_MIN` 从 `90` 降到 `70`，再把 `LINE_RED_DOMINANCE` 从 `25` 降到 `15`。
-3. 如果把橙色/粉色干扰也识别成线，把 `LINE_RED_DOMINANCE` 提到 `35`，或者提高 `LINE_MIN_PIXELS`。
-4. 如果帧率不够，把 `RGB888P_SIZE` 改成 `[640, 360]`。
+2. 如果一直 `LINE LOST`，先把 `LINE_RED_MIN` 从 `70` 降到 `50`，再把 `LINE_RED_DOMINANCE` 从 `15` 降到 `8`。
+3. 如果橙色/粉色干扰也被当成线，把 `LINE_RED_DOMINANCE` 提到 `25`，或者提高 `LINE_MIN_PIXELS`。
+4. 串口如果已经输出 `$LN,...,1,...` 但车不转，说明视觉已经看到线，下一步查 STM32 是否解析 `$LN` 并接入转向控制。

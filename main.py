@@ -44,6 +44,32 @@ ARRIVE_BOX_HEIGHT_RATIO = 0.35
 # Calibrate it on your car. Example: at 1000 mm, box height is 90 px -> K = 90000.
 DISTANCE_K_BY_HEIGHT = 90000
 
+# Line tracking. This uses bottom ROIs and red-line blob centers.
+ENABLE_LINE_TRACK = True
+LINE_USE_RAW_RGB_SCAN = True
+LINE_TRY_FIND_BLOBS_FALLBACK = True
+LINE_FULL_FRAME_FALLBACK = True
+LINE_ACCEPT_BGR_RED = True
+LINE_DETECT_EVERY_N_FRAMES = 1
+LINE_THRESHOLDS = [(10, 100, 10, 127, -30, 127)]
+LINE_MIN_PIXELS = 20
+LINE_MIN_AREA = 20
+LINE_SCAN_STEP_X = 4
+LINE_SCAN_STEP_Y = 3
+LINE_RED_MIN = 70
+LINE_RED_DOMINANCE = 15
+LINE_RED_RATIO_NUM = 5
+LINE_RED_RATIO_DEN = 4
+LINE_FULL_FRAME_MIN_PIXELS = 40
+LINE_ROI_BANDS = [
+    (0.35, 0.18, 1.0),
+    (0.55, 0.18, 1.8),
+    (0.75, 0.20, 2.8),
+]
+LINE_SMOOTH_ALPHA = 0.65
+LINE_LOST_RESET_FRAMES = 5
+DRAW_LINE_ROIS = True
+
 # UART protocol output. Official examples commonly use UART2 on pins 11/12.
 USE_UART = True
 UART_ID = 2
@@ -68,6 +94,8 @@ COLOR_LOCKED = (255, 255, 40, 40)
 COLOR_GUIDE = (160, 255, 255, 255)
 COLOR_TEXT = (255, 255, 255, 255)
 COLOR_WARN = (255, 255, 220, 0)
+COLOR_LINE = (255, 40, 220, 40)
+COLOR_LINE_ROI = (120, 255, 255, 0)
 
 
 def join_path(root, name):
@@ -205,6 +233,392 @@ class FpsMeter:
             self.count = 0
             self.last_ms = now
         return self.fps
+
+
+class LineTracker:
+    def __init__(self, frame_size):
+        self.frame_w = frame_size[0]
+        self.frame_h = frame_size[1]
+        self.rois = self._build_rois()
+        self.lost_count = 0
+        self.enabled = True
+        self.error_reported = False
+        self.raw_error_reported = False
+        self.debug_red_pixels = 0
+        self.debug_scan_pixels = 0
+        self.last = self._empty_result()
+
+    def _empty_result(self):
+        return {
+            "seen": 0,
+            "err_x": 0,
+            "angle": 0,
+            "cx": self.frame_w // 2,
+            "cy": 0,
+            "width": 0,
+            "area": 0,
+            "points": [],
+            "rois": self.rois,
+            "frame_w": self.frame_w,
+            "frame_h": self.frame_h,
+            "red_pixels": self.debug_red_pixels,
+            "scan_pixels": self.debug_scan_pixels,
+        }
+
+    def _ensure_frame_size(self, img_obj):
+        size = self._infer_frame_size(img_obj)
+        if size is None:
+            return
+        w, h = size
+        if w <= 0 or h <= 0:
+            return
+        if w == self.frame_w and h == self.frame_h:
+            return
+        self.frame_w = w
+        self.frame_h = h
+        self.rois = self._build_rois()
+        print("Line frame size:", self.frame_w, self.frame_h)
+
+    def _infer_frame_size(self, img_obj):
+        try:
+            shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return int(shape[3]), int(shape[2])
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                return int(shape[2]), int(shape[1])
+            if len(shape) == 3 and shape[0] == 3:
+                return int(shape[2]), int(shape[1])
+            if len(shape) == 3 and shape[2] == 3:
+                return int(shape[1]), int(shape[0])
+            if len(shape) == 2:
+                return int(shape[1]), int(shape[0])
+        except Exception:
+            pass
+
+        try:
+            return int(img_obj.width()), int(img_obj.height())
+        except Exception:
+            pass
+
+        try:
+            return int(img_obj.width), int(img_obj.height)
+        except Exception:
+            return None
+
+    def _build_rois(self):
+        rois = []
+        for band in LINE_ROI_BANDS:
+            y_ratio, h_ratio, weight = band
+            y = int(self.frame_h * y_ratio)
+            h = int(self.frame_h * h_ratio)
+            if y < 0:
+                y = 0
+            if y + h > self.frame_h:
+                h = self.frame_h - y
+            if h <= 0:
+                continue
+            rois.append({
+                "rect": (0, y, self.frame_w, h),
+                "weight": weight,
+            })
+        return rois
+
+    def update(self, img_obj):
+        if not ENABLE_LINE_TRACK or not self.enabled or img_obj is None:
+            self.last = self._empty_result()
+            return self.last
+
+        self._ensure_frame_size(img_obj)
+        points = []
+        total_weight = 0.0
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_area = 0
+        max_width = 0
+        self.debug_red_pixels = 0
+        self.debug_scan_pixels = 0
+
+        for roi_def in self.rois:
+            rect = roi_def["rect"]
+            weight = roi_def["weight"]
+            if LINE_USE_RAW_RGB_SCAN:
+                blob = self._scan_red_blob(img_obj, rect)
+                if blob is None and LINE_TRY_FIND_BLOBS_FALLBACK:
+                    blob = self._find_best_blob(img_obj, rect, False)
+            else:
+                blob = self._find_best_blob(img_obj, rect, True)
+            if blob is None:
+                continue
+            x, y, w, h = self._blob_rect(blob)
+            cx = x + w // 2
+            cy = y + h // 2
+            area = self._blob_area(blob, w, h)
+            points.append((cx, cy, w, h, area, rect))
+            sum_x += cx * weight
+            sum_y += cy * weight
+            total_weight += weight
+            sum_area += area
+            if w > max_width:
+                max_width = w
+
+        if total_weight <= 0 and LINE_FULL_FRAME_FALLBACK:
+            full_rect = (0, 0, self.frame_w, self.frame_h)
+            blob = self._scan_red_blob(img_obj, full_rect, LINE_FULL_FRAME_MIN_PIXELS)
+            if blob is not None:
+                x, y, w, h = self._blob_rect(blob)
+                cx = x + w // 2
+                cy = y + h // 2
+                area = self._blob_area(blob, w, h)
+                points.append((cx, cy, w, h, area, full_rect))
+                sum_x = float(cx)
+                sum_y = float(cy)
+                total_weight = 1.0
+                sum_area = area
+                max_width = w
+
+        if total_weight <= 0:
+            self.lost_count += 1
+            if self.lost_count >= LINE_LOST_RESET_FRAMES:
+                self.last = self._empty_result()
+            else:
+                self.last["seen"] = 0
+                self.last["red_pixels"] = self.debug_red_pixels
+                self.last["scan_pixels"] = self.debug_scan_pixels
+            return self.last
+
+        self.lost_count = 0
+        cx = int(sum_x / total_weight)
+        cy = int(sum_y / total_weight)
+        err_x = cx - self.frame_w // 2
+        angle = self._estimate_angle(points)
+
+        result = {
+            "seen": 1,
+            "err_x": err_x,
+            "angle": angle,
+            "cx": cx,
+            "cy": cy,
+            "width": max_width,
+            "area": sum_area,
+            "points": points,
+            "rois": self.rois,
+            "frame_w": self.frame_w,
+            "frame_h": self.frame_h,
+            "red_pixels": self.debug_red_pixels,
+            "scan_pixels": self.debug_scan_pixels,
+        }
+        self.last = self._smooth(result)
+        return self.last
+
+    def _scan_red_blob(self, img_obj, rect, min_pixels=None):
+        if min_pixels is None:
+            min_pixels = LINE_MIN_PIXELS
+        x0, y0, rw, rh = rect
+        x1 = x0 + rw
+        y1 = y0 + rh
+        count = 0
+        sum_x = 0
+        sum_y = 0
+        min_x = x1
+        min_y = y1
+        max_x = x0
+        max_y = y0
+
+        for y in range(y0, y1, LINE_SCAN_STEP_Y):
+            for x in range(x0, x1, LINE_SCAN_STEP_X):
+                pixel = self._get_rgb_pixel(img_obj, x, y)
+                if pixel is None:
+                    return None
+                r, g, b = pixel
+                self.debug_scan_pixels += 1
+                if self._is_red_pixel(r, g, b):
+                    self.debug_red_pixels += 1
+                    count += 1
+                    sum_x += x
+                    sum_y += y
+                    if x < min_x:
+                        min_x = x
+                    if y < min_y:
+                        min_y = y
+                    if x > max_x:
+                        max_x = x
+                    if y > max_y:
+                        max_y = y
+
+        if count < min_pixels:
+            return None
+
+        cx = int(sum_x / count)
+        cy = int(sum_y / count)
+        w = max_x - min_x + LINE_SCAN_STEP_X
+        h = max_y - min_y + LINE_SCAN_STEP_Y
+        area = count * LINE_SCAN_STEP_X * LINE_SCAN_STEP_Y
+        if area < LINE_MIN_AREA:
+            return None
+        return (cx - w // 2, cy - h // 2, w, h, area)
+
+    def _get_rgb_pixel(self, img_obj, x, y):
+        try:
+            shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                value = img_obj[0][y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+            if len(shape) == 3 and shape[0] == 3:
+                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
+            if len(shape) == 3 and shape[2] == 3:
+                value = img_obj[y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            pass
+
+        try:
+            value = img_obj[y][x]
+        except Exception:
+            try:
+                value = img_obj.get_pixel(x, y)
+            except Exception:
+                self._report_raw_scan_error()
+                return None
+
+        try:
+            if len(value) >= 3:
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            pass
+
+        try:
+            raw = int(value)
+            if raw <= 0xFFFF:
+                r = ((raw >> 11) & 0x1F) << 3
+                g = ((raw >> 5) & 0x3F) << 2
+                b = (raw & 0x1F) << 3
+            else:
+                r = (raw >> 16) & 0xFF
+                g = (raw >> 8) & 0xFF
+                b = raw & 0xFF
+            return r, g, b
+        except Exception:
+            return None
+
+    def _report_raw_scan_error(self):
+        if not self.raw_error_reported:
+            print("line raw RGB scan unavailable, trying find_blobs fallback")
+            self.raw_error_reported = True
+
+    def _is_red_pixel(self, r, g, b):
+        if self._is_red_order(r, g, b):
+            return True
+        if LINE_ACCEPT_BGR_RED and self._is_red_order(b, g, r):
+            return True
+        return False
+
+    def _is_red_order(self, r, g, b):
+        if r < LINE_RED_MIN:
+            return False
+        if r < g + LINE_RED_DOMINANCE:
+            return False
+        if r < b + LINE_RED_DOMINANCE:
+            return False
+        if r * LINE_RED_RATIO_DEN < g * LINE_RED_RATIO_NUM:
+            return False
+        return True
+
+    def _find_best_blob(self, img_obj, rect, disable_on_error=True):
+        try:
+            blobs = img_obj.find_blobs(
+                LINE_THRESHOLDS,
+                roi=rect,
+                pixels_threshold=LINE_MIN_PIXELS,
+                area_threshold=LINE_MIN_AREA,
+                merge=True,
+            )
+        except TypeError:
+            try:
+                blobs = img_obj.find_blobs(LINE_THRESHOLDS, roi=rect, pixels_threshold=LINE_MIN_PIXELS)
+            except Exception as e:
+                if disable_on_error:
+                    self._disable(e)
+                else:
+                    self._report_find_blobs_fallback_error()
+                return None
+        except Exception as e:
+            if disable_on_error:
+                self._disable(e)
+            else:
+                self._report_find_blobs_fallback_error()
+            return None
+
+        best = None
+        best_score = -1
+        for blob in blobs:
+            x, y, w, h = self._blob_rect(blob)
+            area = self._blob_area(blob, w, h)
+            score = area + w * 3 + h
+            if score > best_score:
+                best_score = score
+                best = blob
+        return best
+
+    def _disable(self, error):
+        self.enabled = False
+        if not self.error_reported:
+            print("line find_blobs disabled:", error)
+            self.error_reported = True
+
+    def _report_find_blobs_fallback_error(self):
+        if not self.error_reported:
+            print("line find_blobs fallback unavailable, keep raw RGB scan")
+            self.error_reported = True
+
+    def _blob_rect(self, blob):
+        try:
+            if len(blob) >= 5:
+                return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
+        except Exception:
+            pass
+        try:
+            return int(blob.x()), int(blob.y()), int(blob.w()), int(blob.h())
+        except Exception:
+            return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
+
+    def _blob_area(self, blob, w, h):
+        try:
+            if len(blob) >= 5:
+                return int(blob[4])
+        except Exception:
+            pass
+        try:
+            return int(blob.pixels())
+        except Exception:
+            return int(w * h)
+
+    def _estimate_angle(self, points):
+        if len(points) < 2:
+            return 0
+        top = points[0]
+        bottom = points[-1]
+        dx = bottom[0] - top[0]
+        dy = bottom[1] - top[1]
+        if dy == 0:
+            return 0
+        # Small-angle approximation is enough for steering and avoids extra math deps.
+        angle = int(dx * 57 / dy)
+        return clamp(angle, -60, 60)
+
+    def _smooth(self, result):
+        if self.last is None or not self.last["seen"]:
+            return result
+        a = LINE_SMOOTH_ALPHA
+        b = 1.0 - LINE_SMOOTH_ALPHA
+        result["err_x"] = int(self.last["err_x"] * b + result["err_x"] * a)
+        result["angle"] = int(self.last["angle"] * b + result["angle"] * a)
+        result["cx"] = int(self.last["cx"] * b + result["cx"] * a)
+        result["cy"] = int(self.last["cy"] * b + result["cy"] * a)
+        result["width"] = int(self.last["width"] * b + result["width"] * a)
+        result["area"] = int(self.last["area"] * b + result["area"] * a)
+        return result
 
 
 class UartBridge:
@@ -475,6 +889,26 @@ def build_payload(frame_id, target_id, candidate, locked, hits, fps):
     )
 
 
+def build_line_payload(frame_id, line_result, fps):
+    if line_result is None or not line_result["seen"]:
+        return "LN,%d,0,0,0,0,0,0,%d" % (frame_id, fps)
+    return "LN,%d,1,%d,%d,%d,%d,%d,%d" % (
+        frame_id,
+        line_result["err_x"],
+        line_result["angle"],
+        line_result["cx"],
+        line_result["width"],
+        line_result["area"],
+        fps,
+    )
+
+
+def source_size_from_line(line_result):
+    if line_result is not None and "frame_w" in line_result and "frame_h" in line_result:
+        return line_result["frame_w"], line_result["frame_h"]
+    return RGB888P_SIZE[0], RGB888P_SIZE[1]
+
+
 def scaled_rect(candidate, display_size):
     dw = display_size[0]
     dh = display_size[1]
@@ -485,6 +919,22 @@ def scaled_rect(candidate, display_size):
     w = int(candidate["w"] * dw // rw)
     h = int(candidate["h"] * dh // rh)
     return x, y, w, h
+
+
+def scale_xy(x, y, display_size, source_size=None):
+    if source_size is None:
+        source_size = RGB888P_SIZE
+    return int(x * display_size[0] // source_size[0]), int(y * display_size[1] // source_size[1])
+
+
+def scale_rect_xywh(rect, display_size, source_size=None):
+    x, y, w, h = rect
+    if source_size is None:
+        source_size = RGB888P_SIZE
+    sx, sy = scale_xy(x, y, display_size, source_size)
+    sw = int(w * display_size[0] // source_size[0])
+    sh = int(h * display_size[1] // source_size[1])
+    return sx, sy, sw, sh
 
 
 def draw_candidate(draw_img, candidate, display_size, selected_id, locked):
@@ -505,7 +955,40 @@ def draw_candidate(draw_img, candidate, display_size, selected_id, locked):
     draw_img.draw_string_advanced(x, ty, 22, text, color=color)
 
 
-def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, display_size):
+def draw_line_overlay(draw_img, line_result, display_size):
+    if line_result is None:
+        return
+    source_size = source_size_from_line(line_result)
+
+    if DRAW_LINE_ROIS:
+        for roi_def in line_result["rois"]:
+            x, y, w, h = scale_rect_xywh(roi_def["rect"], display_size, source_size)
+            draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
+
+    if not line_result["seen"]:
+        red_pixels = line_result.get("red_pixels", 0)
+        scan_pixels = line_result.get("scan_pixels", 0)
+        text = "LINE LOST r:%d/%d" % (red_pixels, scan_pixels)
+        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_WARN)
+        return
+
+    lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
+    draw_img.draw_circle(lx, ly, 7, color=COLOR_LINE, fill=True)
+    draw_img.draw_line(display_size[0] // 2, display_size[1], lx, ly, color=COLOR_LINE, thickness=3)
+
+    for point in line_result["points"]:
+        px, py = scale_xy(point[0], point[1], display_size, source_size)
+        draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
+
+    text = "LINE ex:%d ang:%d r:%d" % (
+        line_result["err_x"],
+        line_result["angle"],
+        line_result.get("red_pixels", 0),
+    )
+    draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_LINE)
+
+
+def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, display_size, line_result):
     draw_img.clear()
     dw = display_size[0]
     dh = display_size[1]
@@ -515,6 +998,7 @@ def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, d
     draw_img.draw_line(cx, 0, cx, dh, color=COLOR_GUIDE, thickness=1)
     draw_img.draw_line(cx - center_tol, dh - 70, cx - center_tol, dh, color=COLOR_GUIDE, thickness=2)
     draw_img.draw_line(cx + center_tol, dh - 70, cx + center_tol, dh, color=COLOR_GUIDE, thickness=2)
+    draw_line_overlay(draw_img, line_result, display_size)
 
     selected_id = -1
     if selected is not None:
@@ -571,9 +1055,11 @@ def main():
     print("Model:", kmodel_path)
     print("Labels:", labels)
     print("Model type:", model_type)
+    print("Line mode:", "RAW_RGB_SCAN" if LINE_USE_RAW_RGB_SCAN else "find_blobs")
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
+    line_tracker = LineTracker(RGB888P_SIZE)
     fps_meter = FpsMeter()
     runtime_target = DEFAULT_TARGET_ID
     frame_id = 0
@@ -617,7 +1103,13 @@ def main():
                 fps = fps_meter.update()
 
                 img = pl.get_frame()
+                line_result = None
+                if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
+                    line_result = line_tracker.update(img)
+                else:
+                    line_result = line_tracker.last
                 res = det_app.run(img)
+
                 candidates = result_to_candidates(res, labels)
                 picked = pick_candidate(candidates, runtime_target)
                 selected, locked, hits = stabilizer.update(picked)
@@ -625,8 +1117,10 @@ def main():
                 if frame_id % SEND_EVERY_N_FRAMES == 0:
                     payload = build_payload(frame_id, runtime_target, selected, locked, hits, fps)
                     bridge.write_packet(payload)
+                    line_payload = build_line_payload(frame_id, line_result, fps)
+                    bridge.write_packet(line_payload)
 
-                draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size)
+                draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
                 pl.show_image()
                 gc.collect()
 
