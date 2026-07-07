@@ -44,27 +44,24 @@ ARRIVE_BOX_HEIGHT_RATIO = 0.35
 # Calibrate it on your car. Example: at 1000 mm, box height is 90 px -> K = 90000.
 DISTANCE_K_BY_HEIGHT = 90000
 
-# Line tracking. This uses bottom ROIs and red-line blob centers.
+# Line tracking. This follows Car_Mode's weighted multi-sensor idea:
+# a few fixed ROI "virtual sensors" find the line and report weighted error.
 ENABLE_LINE_TRACK = True
-LINE_USE_RAW_RGB_SCAN = True
-LINE_TRY_FIND_BLOBS_FALLBACK = True
-LINE_FULL_FRAME_FALLBACK = True
-LINE_ACCEPT_BGR_RED = True
-LINE_DETECT_EVERY_N_FRAMES = 1
+LINE_DETECT_EVERY_N_FRAMES = 3
 LINE_THRESHOLDS = [(10, 100, 10, 127, -30, 127)]
-LINE_MIN_PIXELS = 20
-LINE_MIN_AREA = 20
-LINE_SCAN_STEP_X = 4
-LINE_SCAN_STEP_Y = 3
-LINE_RED_MIN = 70
-LINE_RED_DOMINANCE = 15
-LINE_RED_RATIO_NUM = 5
-LINE_RED_RATIO_DEN = 4
-LINE_FULL_FRAME_MIN_PIXELS = 40
+LINE_MIN_PIXELS = 80
+LINE_MIN_AREA = 80
+LINE_USE_SPARSE_RGB_FALLBACK = True
+LINE_SPARSE_STEP_X = 32
+LINE_SPARSE_STEP_Y = 16
+LINE_SPARSE_MIN_HITS = 6
+LINE_RED_MIN = 80
+LINE_RED_DOMINANCE = 8
+LINE_ACCEPT_BGR_RED = True
 LINE_ROI_BANDS = [
-    (0.35, 0.18, 1.0),
-    (0.55, 0.18, 1.8),
-    (0.75, 0.20, 2.8),
+    (0.58, 0.10, 1.0),
+    (0.70, 0.10, 1.8),
+    (0.82, 0.10, 2.8),
 ]
 LINE_SMOOTH_ALPHA = 0.65
 LINE_LOST_RESET_FRAMES = 5
@@ -243,9 +240,6 @@ class LineTracker:
         self.lost_count = 0
         self.enabled = True
         self.error_reported = False
-        self.raw_error_reported = False
-        self.debug_red_pixels = 0
-        self.debug_scan_pixels = 0
         self.last = self._empty_result()
 
     def _empty_result(self):
@@ -261,8 +255,6 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
-            "red_pixels": self.debug_red_pixels,
-            "scan_pixels": self.debug_scan_pixels,
         }
 
     def _ensure_frame_size(self, img_obj):
@@ -335,18 +327,13 @@ class LineTracker:
         sum_y = 0.0
         sum_area = 0
         max_width = 0
-        self.debug_red_pixels = 0
-        self.debug_scan_pixels = 0
 
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
-            if LINE_USE_RAW_RGB_SCAN:
-                blob = self._scan_red_blob(img_obj, rect)
-                if blob is None and LINE_TRY_FIND_BLOBS_FALLBACK:
-                    blob = self._find_best_blob(img_obj, rect, False)
-            else:
-                blob = self._find_best_blob(img_obj, rect, True)
+            blob = self._find_best_blob(img_obj, rect)
+            if blob is None and LINE_USE_SPARSE_RGB_FALLBACK:
+                blob = self._sparse_red_blob(img_obj, rect)
             if blob is None:
                 continue
             x, y, w, h = self._blob_rect(blob)
@@ -361,29 +348,12 @@ class LineTracker:
             if w > max_width:
                 max_width = w
 
-        if total_weight <= 0 and LINE_FULL_FRAME_FALLBACK:
-            full_rect = (0, 0, self.frame_w, self.frame_h)
-            blob = self._scan_red_blob(img_obj, full_rect, LINE_FULL_FRAME_MIN_PIXELS)
-            if blob is not None:
-                x, y, w, h = self._blob_rect(blob)
-                cx = x + w // 2
-                cy = y + h // 2
-                area = self._blob_area(blob, w, h)
-                points.append((cx, cy, w, h, area, full_rect))
-                sum_x = float(cx)
-                sum_y = float(cy)
-                total_weight = 1.0
-                sum_area = area
-                max_width = w
-
         if total_weight <= 0:
             self.lost_count += 1
             if self.lost_count >= LINE_LOST_RESET_FRAMES:
                 self.last = self._empty_result()
             else:
                 self.last["seen"] = 0
-                self.last["red_pixels"] = self.debug_red_pixels
-                self.last["scan_pixels"] = self.debug_scan_pixels
             return self.last
 
         self.lost_count = 0
@@ -404,19 +374,15 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
-            "red_pixels": self.debug_red_pixels,
-            "scan_pixels": self.debug_scan_pixels,
         }
         self.last = self._smooth(result)
         return self.last
 
-    def _scan_red_blob(self, img_obj, rect, min_pixels=None):
-        if min_pixels is None:
-            min_pixels = LINE_MIN_PIXELS
+    def _sparse_red_blob(self, img_obj, rect):
         x0, y0, rw, rh = rect
         x1 = x0 + rw
         y1 = y0 + rh
-        count = 0
+        hits = 0
         sum_x = 0
         sum_y = 0
         min_x = x1
@@ -424,16 +390,14 @@ class LineTracker:
         max_x = x0
         max_y = y0
 
-        for y in range(y0, y1, LINE_SCAN_STEP_Y):
-            for x in range(x0, x1, LINE_SCAN_STEP_X):
+        for y in range(y0, y1, LINE_SPARSE_STEP_Y):
+            for x in range(x0, x1, LINE_SPARSE_STEP_X):
                 pixel = self._get_rgb_pixel(img_obj, x, y)
                 if pixel is None:
                     return None
                 r, g, b = pixel
-                self.debug_scan_pixels += 1
                 if self._is_red_pixel(r, g, b):
-                    self.debug_red_pixels += 1
-                    count += 1
+                    hits += 1
                     sum_x += x
                     sum_y += y
                     if x < min_x:
@@ -445,42 +409,21 @@ class LineTracker:
                     if y > max_y:
                         max_y = y
 
-        if count < min_pixels:
+        if hits < LINE_SPARSE_MIN_HITS:
             return None
 
-        cx = int(sum_x / count)
-        cy = int(sum_y / count)
-        w = max_x - min_x + LINE_SCAN_STEP_X
-        h = max_y - min_y + LINE_SCAN_STEP_Y
-        area = count * LINE_SCAN_STEP_X * LINE_SCAN_STEP_Y
-        if area < LINE_MIN_AREA:
-            return None
+        cx = int(sum_x / hits)
+        cy = int(sum_y / hits)
+        w = max(LINE_SPARSE_STEP_X, max_x - min_x + LINE_SPARSE_STEP_X)
+        h = max(LINE_SPARSE_STEP_Y, max_y - min_y + LINE_SPARSE_STEP_Y)
+        area = hits * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
         return (cx - w // 2, cy - h // 2, w, h, area)
 
     def _get_rgb_pixel(self, img_obj, x, y):
         try:
-            shape = img_obj.shape
-            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
-                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
-            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
-                value = img_obj[0][y][x]
-                return int(value[0]), int(value[1]), int(value[2])
-            if len(shape) == 3 and shape[0] == 3:
-                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
-            if len(shape) == 3 and shape[2] == 3:
-                value = img_obj[y][x]
-                return int(value[0]), int(value[1]), int(value[2])
+            value = img_obj.get_pixel(x, y)
         except Exception:
-            pass
-
-        try:
-            value = img_obj[y][x]
-        except Exception:
-            try:
-                value = img_obj.get_pixel(x, y)
-            except Exception:
-                self._report_raw_scan_error()
-                return None
+            return None
 
         try:
             if len(value) >= 3:
@@ -502,11 +445,6 @@ class LineTracker:
         except Exception:
             return None
 
-    def _report_raw_scan_error(self):
-        if not self.raw_error_reported:
-            print("line raw RGB scan unavailable, trying find_blobs fallback")
-            self.raw_error_reported = True
-
     def _is_red_pixel(self, r, g, b):
         if self._is_red_order(r, g, b):
             return True
@@ -521,11 +459,9 @@ class LineTracker:
             return False
         if r < b + LINE_RED_DOMINANCE:
             return False
-        if r * LINE_RED_RATIO_DEN < g * LINE_RED_RATIO_NUM:
-            return False
         return True
 
-    def _find_best_blob(self, img_obj, rect, disable_on_error=True):
+    def _find_best_blob(self, img_obj, rect):
         try:
             blobs = img_obj.find_blobs(
                 LINE_THRESHOLDS,
@@ -538,16 +474,10 @@ class LineTracker:
             try:
                 blobs = img_obj.find_blobs(LINE_THRESHOLDS, roi=rect, pixels_threshold=LINE_MIN_PIXELS)
             except Exception as e:
-                if disable_on_error:
-                    self._disable(e)
-                else:
-                    self._report_find_blobs_fallback_error()
+                self._report_find_blobs_error(e)
                 return None
         except Exception as e:
-            if disable_on_error:
-                self._disable(e)
-            else:
-                self._report_find_blobs_fallback_error()
+            self._report_find_blobs_error(e)
             return None
 
         best = None
@@ -561,15 +491,9 @@ class LineTracker:
                 best = blob
         return best
 
-    def _disable(self, error):
-        self.enabled = False
+    def _report_find_blobs_error(self, error):
         if not self.error_reported:
-            print("line find_blobs disabled:", error)
-            self.error_reported = True
-
-    def _report_find_blobs_fallback_error(self):
-        if not self.error_reported:
-            print("line find_blobs fallback unavailable, keep raw RGB scan")
+            print("line find_blobs unavailable, using sparse RGB fallback:", error)
             self.error_reported = True
 
     def _blob_rect(self, blob):
@@ -966,10 +890,7 @@ def draw_line_overlay(draw_img, line_result, display_size):
             draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
 
     if not line_result["seen"]:
-        red_pixels = line_result.get("red_pixels", 0)
-        scan_pixels = line_result.get("scan_pixels", 0)
-        text = "LINE LOST r:%d/%d" % (red_pixels, scan_pixels)
-        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_WARN)
+        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, "LINE LOST", color=COLOR_WARN)
         return
 
     lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
@@ -980,11 +901,7 @@ def draw_line_overlay(draw_img, line_result, display_size):
         px, py = scale_xy(point[0], point[1], display_size, source_size)
         draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
 
-    text = "LINE ex:%d ang:%d r:%d" % (
-        line_result["err_x"],
-        line_result["angle"],
-        line_result.get("red_pixels", 0),
-    )
+    text = "LINE ex:%d ang:%d" % (line_result["err_x"], line_result["angle"])
     draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_LINE)
 
 
@@ -1055,7 +972,7 @@ def main():
     print("Model:", kmodel_path)
     print("Labels:", labels)
     print("Model type:", model_type)
-    print("Line mode:", "RAW_RGB_SCAN" if LINE_USE_RAW_RGB_SCAN else "find_blobs")
+    print("Line mode: weighted ROI find_blobs")
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
@@ -1103,12 +1020,12 @@ def main():
                 fps = fps_meter.update()
 
                 img = pl.get_frame()
+                res = det_app.run(img)
                 line_result = None
                 if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
                     line_result = line_tracker.update(img)
                 else:
                     line_result = line_tracker.last
-                res = det_app.run(img)
 
                 candidates = result_to_candidates(res, labels)
                 picked = pick_candidate(candidates, runtime_target)

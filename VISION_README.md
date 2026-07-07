@@ -31,9 +31,9 @@
 - `ARRIVE_BOX_HEIGHT_RATIO`：判定到达药房的框高比例，越大越靠近才停车。
 - `DISTANCE_K_BY_HEIGHT`：粗略距离估计系数，需要现场标定。
 - `ENABLE_LINE_TRACK`：是否启用循迹。
-- `LINE_USE_RAW_RGB_SCAN`：默认开启，直接扫描图像里的红色像素，避开部分 K230 图像对象不支持 `find_blobs` 的问题。
-- `LINE_RED_MIN` / `LINE_RED_DOMINANCE`：红线像素判定阈值，看不到线时优先调低。
-- `LINE_ROI_BANDS`：底部循迹区域和权重，越靠下权重越大。
+- `LINE_DETECT_EVERY_N_FRAMES`：循迹降频，默认每 3 帧跑一次，减少对数字识别的影响。
+- `LINE_THRESHOLDS`：红线 LAB 阈值，用 `find_blobs` 在少量 ROI 内找线。
+- `LINE_ROI_BANDS`：底部少量 ROI 和权重，思路类似 `Car_Mode` 的多路灰度传感器加权误差。
 
 ## 下位机串口协议
 
@@ -128,6 +128,6 @@ T0
 循迹调试建议：
 
 1. 先让画面底部看到红线，屏幕上会出现绿色 ROI、绿色线中心点和 `LINE ex/ang`。
-2. 如果一直 `LINE LOST`，先把 `LINE_RED_MIN` 从 `70` 降到 `50`，再把 `LINE_RED_DOMINANCE` 从 `15` 降到 `8`。
-3. 如果橙色/粉色干扰也被当成线，把 `LINE_RED_DOMINANCE` 提到 `25`，或者提高 `LINE_MIN_PIXELS`。
+2. 如果一直 `LINE LOST`，优先用现场图像重新标定 `LINE_THRESHOLDS`，或者临时把阈值放宽。
+3. 如果包装袋、橙色/粉色干扰也被当成线，提高 `LINE_MIN_PIXELS`，或把 ROI 收窄到真正赛道区域。
 4. 串口如果已经输出 `$LN,...,1,...` 但车不转，说明视觉已经看到线，下一步查 STM32 是否解析 `$LN` 并接入转向控制。
