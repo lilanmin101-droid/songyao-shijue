@@ -42,7 +42,7 @@ VFLIP = None
 DEFAULT_TARGET_ID = 0
 
 # Selection and lock tuning.
-DETECT_EVERY_N_FRAMES = 10
+DETECT_EVERY_N_FRAMES = 5
 SELECT_MIN_SCORE = 0.45
 MIN_BOX_AREA_RATIO = 0.00020
 HISTORY_SIZE = 7
@@ -1212,9 +1212,6 @@ def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, d
         draw_img.draw_line(cx - center_tol, dh - 70, cx - center_tol, dh, color=COLOR_GUIDE, thickness=2)
         draw_img.draw_line(cx + center_tol, dh - 70, cx + center_tol, dh, color=COLOR_GUIDE, thickness=2)
     draw_line_overlay(draw_img, line_result, display_size)
-
-    if FAST_DISPLAY:
-        return
 
     selected_id = -1
     if selected is not None:
