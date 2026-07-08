@@ -57,9 +57,9 @@ LINE_MEMORY_PENALTY = 0.45
 LINE_USE_SPARSE_RGB_FALLBACK = True
 LINE_SPARSE_STEP_X = 32
 LINE_SPARSE_STEP_Y = 16
-LINE_SPARSE_MIN_HITS = 6
+LINE_SPARSE_MIN_HITS = 1
 LINE_RED_MIN = 80
-LINE_RED_DOMINANCE = 8
+LINE_RED_DOMINANCE = 0
 LINE_ACCEPT_BGR_RED = True
 LINE_ROI_BANDS = [
     (0.78, 0.98, 1.00),
@@ -245,6 +245,9 @@ class LineTracker:
         self.error_reported = False
         self.last_offset = 0.0
         self.last_angle = 0.0
+        self.debug_blob_hits = 0
+        self.debug_red_hits = 0
+        self.debug_sample_count = 0
         self.last = self._empty_result()
 
     def _empty_result(self):
@@ -260,6 +263,9 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
+            "blob_hits": self.debug_blob_hits,
+            "red_hits": self.debug_red_hits,
+            "sample_count": self.debug_sample_count,
         }
 
     def _ensure_frame_size(self, img_obj):
@@ -332,11 +338,16 @@ class LineTracker:
         sum_y = 0.0
         sum_area = 0
         max_width = 0
+        self.debug_blob_hits = 0
+        self.debug_red_hits = 0
+        self.debug_sample_count = 0
 
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
             blob = self._find_best_blob(img_obj, rect, self.frame_w * 0.5)
+            if blob is not None:
+                self.debug_blob_hits += 1
             if blob is None and LINE_USE_SPARSE_RGB_FALLBACK:
                 blob = self._sparse_red_blob(img_obj, rect)
             if blob is None:
@@ -359,6 +370,9 @@ class LineTracker:
                 self.last = self._empty_result()
             else:
                 self.last["seen"] = 0
+                self.last["blob_hits"] = self.debug_blob_hits
+                self.last["red_hits"] = self.debug_red_hits
+                self.last["sample_count"] = self.debug_sample_count
             return self.last
 
         self.lost_count = 0
@@ -381,6 +395,9 @@ class LineTracker:
             "rois": self.rois,
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
+            "blob_hits": self.debug_blob_hits,
+            "red_hits": self.debug_red_hits,
+            "sample_count": self.debug_sample_count,
         }
         self.last = self._smooth(result)
         return self.last
@@ -402,8 +419,10 @@ class LineTracker:
                 pixel = self._get_rgb_pixel(img_obj, x, y)
                 if pixel is None:
                     return None
+                self.debug_sample_count += 1
                 r, g, b = pixel
                 if self._is_red_pixel(r, g, b):
+                    self.debug_red_hits += 1
                     hits += 1
                     sum_x += x
                     sum_y += y
@@ -932,7 +951,12 @@ def draw_line_overlay(draw_img, line_result, display_size):
             draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
 
     if not line_result["seen"]:
-        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, "LINE LOST", color=COLOR_WARN)
+        text = "LINE LOST b:%d r:%d/%d" % (
+            line_result.get("blob_hits", 0),
+            line_result.get("red_hits", 0),
+            line_result.get("sample_count", 0),
+        )
+        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_WARN)
         return
 
     lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
@@ -943,7 +967,13 @@ def draw_line_overlay(draw_img, line_result, display_size):
         px, py = scale_xy(point[0], point[1], display_size, source_size)
         draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
 
-    text = "LINE ex:%d ang:%d" % (line_result["err_x"], line_result["angle"])
+    text = "LINE ex:%d ang:%d b:%d r:%d/%d" % (
+        line_result["err_x"],
+        line_result["angle"],
+        line_result.get("blob_hits", 0),
+        line_result.get("red_hits", 0),
+        line_result.get("sample_count", 0),
+    )
     draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_LINE)
 
 
@@ -1062,12 +1092,12 @@ def main():
                 fps = fps_meter.update()
 
                 img = pl.get_frame()
-                res = det_app.run(img)
                 line_result = None
                 if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
                     line_result = line_tracker.update(pl.cur_frame)
                 else:
                     line_result = line_tracker.last
+                res = det_app.run(img)
 
                 candidates = result_to_candidates(res, labels)
                 picked = pick_candidate(candidates, runtime_target)
