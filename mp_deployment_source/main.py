@@ -46,7 +46,7 @@ DISTANCE_K_BY_HEIGHT = 90000
 
 # Line tracking. This follows Car_Mode's weighted multi-sensor idea:
 # a few fixed ROI "virtual sensors" find the line and report weighted error.
-ENABLE_LINE_TRACK = True
+ENABLE_LINE_TRACK = False
 LINE_DETECT_EVERY_N_FRAMES = 3
 LINE_THRESHOLDS = [(15, 100, 25, 127, -20, 90)]
 LINE_MIN_PIXELS = 160
@@ -1044,7 +1044,7 @@ def main():
     print("Model:", kmodel_path)
     print("Labels:", labels)
     print("Model type:", model_type)
-    print("Line mode: pipeline frame weighted ROI find_blobs")
+    print("Line mode:", "disabled" if not ENABLE_LINE_TRACK else "pipeline frame weighted ROI find_blobs")
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
