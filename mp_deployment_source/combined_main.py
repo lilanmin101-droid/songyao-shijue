@@ -8,7 +8,13 @@ try:
 except Exception:
     import json
 
-from media.sensor import Sensor
+try:
+    from media.sensor import Sensor, CAM_CHN_ID_0, CAM_CHN_ID_1, CAM_CHN_ID_2
+except Exception:
+    from media.sensor import Sensor
+    CAM_CHN_ID_0 = 0
+    CAM_CHN_ID_1 = 1
+    CAM_CHN_ID_2 = 2
 from media.display import Display
 from media.media import MediaManager
 
@@ -23,6 +29,8 @@ ROOT_PATH = "/sdcard/mp_deployment_source/"
 # 640x360 keeps the same 16:9-ish view with a wider field than the line debug mode.
 CAM_WIDTH = 640
 CAM_HEIGHT = 360
+AI_WIDTH = 1280
+AI_HEIGHT = 720
 
 # Use "virt" for CanMV IDE preview. Use "lcd" on the real ST7701 screen.
 DISPLAY_MODE = "virt"
@@ -51,7 +59,7 @@ SMOOTH_ALPHA = 0.62
 
 CENTER_TOLERANCE_RATIO = 0.045
 ARRIVE_BOX_HEIGHT_RATIO = 0.35
-DISTANCE_K_BY_HEIGHT = 35000
+DISTANCE_K_BY_HEIGHT = 90000
 
 # Line tracking. These values are copied from the working line_debug_main.py.
 LINE_THRESHOLD = [(15, 100, 25, 127, -20, 90)]
@@ -386,7 +394,7 @@ class SnapshotAnchorDetector:
         if NMS_THRESHOLD_OVERRIDE is not None:
             self.nms_threshold = NMS_THRESHOLD_OVERRIDE
 
-        self.rgb_size = [align_up(CAM_WIDTH, 16), CAM_HEIGHT]
+        self.rgb_size = [align_up(AI_WIDTH, 16), AI_HEIGHT]
         self.kmodel_path = resolve_model_path(deploy_conf["kmodel_path"])
         self.kpu = nn.kpu()
         self.kpu.load_kmodel(self.kmodel_path)
@@ -431,6 +439,16 @@ class SnapshotAnchorDetector:
         return self._postprocess(results)
 
     def _image_to_nchw(self, img):
+        try:
+            arr = img.to_numpy_ref()
+            shape = arr.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return arr
+            if len(shape) == 3 and shape[0] == 3:
+                return arr.reshape((1, shape[0], shape[1], shape[2]))
+        except Exception:
+            pass
+
         try:
             rgb = img.to_rgb888()
         except Exception:
@@ -675,9 +693,9 @@ def det_boxes_to_candidates(det_boxes, labels):
     if not det_boxes:
         return candidates
 
-    min_area = int(CAM_WIDTH * CAM_HEIGHT * MIN_BOX_AREA_RATIO)
-    center_x = CAM_WIDTH // 2
-    center_y = CAM_HEIGHT // 2
+    min_area = int(AI_WIDTH * AI_HEIGHT * MIN_BOX_AREA_RATIO)
+    center_x = AI_WIDTH // 2
+    center_y = AI_HEIGHT // 2
 
     for det in det_boxes:
         try:
@@ -695,10 +713,10 @@ def det_boxes_to_candidates(det_boxes, labels):
         if score < SELECT_MIN_SCORE:
             continue
 
-        x1 = int(clip(x1, 0, CAM_WIDTH - 1))
-        y1 = int(clip(y1, 0, CAM_HEIGHT - 1))
-        x2 = int(clip(x2, 0, CAM_WIDTH - 1))
-        y2 = int(clip(y2, 0, CAM_HEIGHT - 1))
+        x1 = int(clip(x1, 0, AI_WIDTH - 1))
+        y1 = int(clip(y1, 0, AI_HEIGHT - 1))
+        x2 = int(clip(x2, 0, AI_WIDTH - 1))
+        y2 = int(clip(y2, 0, AI_HEIGHT - 1))
         w = x2 - x1
         h = y2 - y1
         if w <= 1 or h <= 1:
@@ -715,7 +733,7 @@ def det_boxes_to_candidates(det_boxes, labels):
         err_x = cx - center_x
         err_y = cy - center_y
 
-        norm_area = float(area) / float(CAM_WIDTH * CAM_HEIGHT)
+        norm_area = float(area) / float(AI_WIDTH * AI_HEIGHT)
         norm_center = abs(float(err_x)) / float(max(1, center_x))
         rank = score * 1000.0 + min(norm_area * 900.0, 260.0) - norm_center * 140.0
 
@@ -764,8 +782,8 @@ def build_payload(frame_id, target_id, candidate, locked, hits, fps):
     if candidate is None:
         return "MV,%d,0,%d,0,0,0,0,0,0,0,0,0,0,0,%d" % (frame_id, target_id, fps)
 
-    center_tol = int(CAM_WIDTH * CENTER_TOLERANCE_RATIO)
-    arrive_h = int(CAM_HEIGHT * ARRIVE_BOX_HEIGHT_RATIO)
+    center_tol = int(AI_WIDTH * CENTER_TOLERANCE_RATIO)
+    arrive_h = int(AI_HEIGHT * ARRIVE_BOX_HEIGHT_RATIO)
     arrived = locked and abs(candidate["err_x"]) <= center_tol and candidate["h"] >= arrive_h
     state = 3 if arrived else (2 if locked else 1)
     score1000 = int(candidate["score"] * 1000)
@@ -835,7 +853,7 @@ def draw_line_result(img, result, fps):
         draw_text(img, 2, 2, "LINE LOST lost:%d fps:%d" % (result.lost_frames, int(fps)), RED, 15)
 
 
-def draw_digit_result(img, candidates, selected, target_id, locked, hits):
+def draw_digit_result(img, candidates, selected, target_id, locked, hits, raw_boxes_count=0):
     selected_id = -1
     if selected is not None:
         selected_id = selected["drug_id"]
@@ -846,20 +864,24 @@ def draw_digit_result(img, candidates, selected, target_id, locked, hits):
         if cand["drug_id"] == selected_id:
             color = GREEN if locked else CYAN
             thickness = 3
-        img.draw_rectangle(cand["x1"], cand["y1"], cand["w"], cand["h"], color=color, thickness=thickness)
-        draw_text(img, cand["x1"], max(18, cand["y1"]) - 18, "%s %d" % (
+        x = int(cand["x1"] * img.width() // AI_WIDTH)
+        y = int(cand["y1"] * img.height() // AI_HEIGHT)
+        w = max(1, int(cand["w"] * img.width() // AI_WIDTH))
+        h = max(1, int(cand["h"] * img.height() // AI_HEIGHT))
+        img.draw_rectangle(x, y, w, h, color=color, thickness=thickness)
+        draw_text(img, x, max(18, y) - 18, "%s %d" % (
             cand["label"],
             int(cand["score"] * 100),
         ), color, 15)
 
     y = 20
     if selected is None:
-        draw_text(img, 2, y, "DIGIT T:%d SEARCH" % target_id, YELLOW, 15)
+        draw_text(img, 2, y, "DIGIT T:%d SEARCH boxes:%d" % (target_id, raw_boxes_count), YELLOW, 15)
         return
 
     lock_text = "LOCK" if locked else "SEEN"
     target_text = "AUTO" if target_id == 0 else str(target_id)
-    draw_text(img, 2, y, "DIGIT T:%s %s id:%d ex:%d h:%d %d/%d" % (
+    draw_text(img, 2, y, "DIGIT T:%s %s id:%d ex:%d h:%d %d/%d b:%d" % (
         target_text,
         lock_text,
         selected["drug_id"],
@@ -867,14 +889,43 @@ def draw_digit_result(img, candidates, selected, target_id, locked, hits):
         selected["h"],
         hits,
         HISTORY_SIZE,
+        raw_boxes_count,
     ), WHITE, 15)
 
 
 def init_camera():
-    sensor = Sensor(width=CAM_WIDTH, height=CAM_HEIGHT)
+    sensor = Sensor(width=AI_WIDTH, height=AI_HEIGHT)
     sensor.reset()
-    sensor.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT)
-    sensor.set_pixformat(Sensor.RGB565)
+    try:
+        sensor.set_framesize(width=AI_WIDTH, height=AI_HEIGHT, chn=CAM_CHN_ID_0)
+        yuv_format = getattr(Sensor, "YUV420SP", None)
+        if yuv_format is not None:
+            sensor.set_pixformat(yuv_format, chn=CAM_CHN_ID_0)
+    except Exception as exc:
+        print("base channel setup skipped:", exc)
+
+    line_channel = CAM_CHN_ID_1
+    try:
+        sensor.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT, chn=line_channel)
+        sensor.set_pixformat(Sensor.RGB565, chn=line_channel)
+    except Exception as exc:
+        print("line channel chn1 failed, fallback default RGB565:", exc)
+        line_channel = None
+        sensor.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT)
+        sensor.set_pixformat(Sensor.RGB565)
+
+    ai_pixformat = getattr(Sensor, "RGBP888", None)
+    if ai_pixformat is None:
+        try:
+            from media.sensor import PIXEL_FORMAT_RGB_888_PLANAR
+            ai_pixformat = PIXEL_FORMAT_RGB_888_PLANAR
+        except Exception:
+            ai_pixformat = getattr(Sensor, "RGB888", Sensor.RGB565)
+    try:
+        sensor.set_framesize(width=AI_WIDTH, height=AI_HEIGHT, chn=CAM_CHN_ID_2)
+        sensor.set_pixformat(ai_pixformat, chn=CAM_CHN_ID_2)
+    except Exception as exc:
+        print("AI channel setup failed, digit may be disabled:", exc)
     try:
         if HMIRROR and hasattr(sensor, "set_hmirror"):
             sensor.set_hmirror(1)
@@ -882,7 +933,7 @@ def init_camera():
             sensor.set_vflip(1)
     except Exception as exc:
         print("mirror/flip skipped:", exc)
-    return sensor
+    return sensor, line_channel
 
 
 def init_display():
@@ -927,7 +978,7 @@ def main():
                 print("Digit config load failed, line only:", exc)
                 print_exception(exc)
 
-        sensor = init_camera()
+        sensor, line_channel = init_camera()
         display = init_display()
         MediaManager.init()
         sensor.run()
@@ -952,6 +1003,7 @@ def main():
         selected = None
         locked = 0
         hits = 0
+        raw_boxes_count = 0
 
         print("combined started: sensor RGB565 snapshot + line + digit")
         while True:
@@ -969,7 +1021,13 @@ def main():
                     else:
                         print("Target set:", runtime_target)
 
-            img = sensor.snapshot()
+            try:
+                if line_channel is None:
+                    img = sensor.snapshot()
+                else:
+                    img = sensor.snapshot(chn=line_channel)
+            except TypeError:
+                img = sensor.snapshot()
             if img is None:
                 continue
 
@@ -984,7 +1042,12 @@ def main():
 
             if detector is not None and (frame_id % DIGIT_DETECT_EVERY_N_FRAMES == 0 or selected is None):
                 try:
-                    det_boxes = detector.detect(img)
+                    ai_img = sensor.snapshot(chn=CAM_CHN_ID_2)
+                    det_boxes = detector.detect(ai_img)
+                    try:
+                        raw_boxes_count = len(det_boxes) if det_boxes else 0
+                    except Exception:
+                        raw_boxes_count = 0
                     candidates = det_boxes_to_candidates(det_boxes, labels)
                     picked = pick_candidate(candidates, runtime_target)
                     selected, locked, hits = stabilizer.update(picked)
@@ -992,6 +1055,7 @@ def main():
                     print("digit detect failed:", exc)
                     print_exception(exc)
                     candidates = []
+                    raw_boxes_count = 0
                     selected, locked, hits = stabilizer.update(None)
 
             if frame_id % SEND_EVERY_N_FRAMES == 0:
@@ -1000,7 +1064,7 @@ def main():
 
             if SHOW_UI:
                 draw_line_result(img, line_result, fps)
-                draw_digit_result(img, candidates, selected, runtime_target, locked, hits)
+                draw_digit_result(img, candidates, selected, runtime_target, locked, hits, raw_boxes_count)
                 show_image(display, img)
 
             if frame_id % 20 == 0:
