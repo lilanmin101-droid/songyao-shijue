@@ -42,6 +42,7 @@ VFLIP = None
 DEFAULT_TARGET_ID = 0
 
 # Selection and lock tuning.
+DETECT_EVERY_N_FRAMES = 5
 SELECT_MIN_SCORE = 0.45
 MIN_BOX_AREA_RATIO = 0.00020
 HISTORY_SIZE = 7
@@ -83,9 +84,9 @@ LINE_ROI_BANDS = [
     (0.76, 0.98, 1.00),
     (0.52, 0.70, 0.55),
 ]
-LINE_SMOOTH_ALPHA = 0.90
+LINE_SMOOTH_ALPHA = 1.00
 LINE_LOST_RESET_FRAMES = 5
-DRAW_LINE_ROIS = True
+DRAW_LINE_ROIS = False
 
 # UART protocol output. Official examples commonly use UART2 on pins 11/12.
 USE_UART = True
@@ -93,8 +94,11 @@ UART_ID = 2
 UART_BAUDRATE = 115200
 UART_TX_PIN = 11
 UART_RX_PIN = 12
-SEND_EVERY_N_FRAMES = 1
+LINE_SEND_EVERY_N_FRAMES = 1
+MV_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
+DISPLAY_EVERY_N_FRAMES = 2
 PRINT_PROTOCOL_WHEN_NO_UART = True
+GC_EVERY_N_FRAMES = 20
 
 # If the model is noisy in your venue, raise to 0.48-0.55.
 CONFIDENCE_THRESHOLD_OVERRIDE = None
@@ -1172,6 +1176,7 @@ def main():
     print("Labels:", labels)
     print("Model type:", model_type)
     print("Line mode:", "disabled" if not ENABLE_LINE_TRACK else "shared RGBP888 sparse red tracking")
+    print("Detection interval:", DETECT_EVERY_N_FRAMES)
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
@@ -1179,6 +1184,10 @@ def main():
     fps_meter = FpsMeter()
     runtime_target = DEFAULT_TARGET_ID
     frame_id = 0
+    candidates = []
+    selected = None
+    locked = 0
+    hits = 0
 
     pl = None
     det_app = None
@@ -1214,6 +1223,10 @@ def main():
                     if accepted:
                         runtime_target = new_target
                         stabilizer.reset()
+                        candidates = []
+                        selected = None
+                        locked = 0
+                        hits = 0
                         if accepted == 2:
                             print("Vision lock reset")
                         else:
@@ -1229,22 +1242,25 @@ def main():
                     line_result["src"] = "ai"
                 else:
                     line_result = line_tracker.last
-                if frame_id % SEND_EVERY_N_FRAMES == 0:
+                if frame_id % LINE_SEND_EVERY_N_FRAMES == 0:
                     line_payload = build_line_payload(frame_id, line_result, fps)
                     bridge.write_packet(line_payload)
-                res = det_app.run(img)
 
-                candidates = result_to_candidates(res, labels)
-                picked = pick_candidate(candidates, runtime_target)
-                selected, locked, hits = stabilizer.update(picked)
+                if frame_id == 1 or frame_id % DETECT_EVERY_N_FRAMES == 0:
+                    res = det_app.run(img)
+                    candidates = result_to_candidates(res, labels)
+                    picked = pick_candidate(candidates, runtime_target)
+                    selected, locked, hits = stabilizer.update(picked)
 
-                if frame_id % SEND_EVERY_N_FRAMES == 0:
+                if frame_id == 1 or frame_id % MV_SEND_EVERY_N_FRAMES == 0:
                     payload = build_payload(frame_id, runtime_target, selected, locked, hits, fps)
                     bridge.write_packet(payload)
 
-                draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
-                pl.show_image()
-                gc.collect()
+                if frame_id == 1 or frame_id % DISPLAY_EVERY_N_FRAMES == 0:
+                    draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
+                    pl.show_image()
+                if frame_id % GC_EVERY_N_FRAMES == 0:
+                    gc.collect()
 
     except KeyboardInterrupt:
         print("Stopped by user")
