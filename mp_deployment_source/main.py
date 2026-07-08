@@ -48,9 +48,12 @@ DISTANCE_K_BY_HEIGHT = 90000
 # a few fixed ROI "virtual sensors" find the line and report weighted error.
 ENABLE_LINE_TRACK = True
 LINE_DETECT_EVERY_N_FRAMES = 3
-LINE_THRESHOLDS = [(10, 100, 10, 127, -30, 127)]
-LINE_MIN_PIXELS = 80
-LINE_MIN_AREA = 80
+LINE_THRESHOLDS = [(15, 100, 25, 127, -20, 90)]
+LINE_MIN_PIXELS = 160
+LINE_MIN_AREA = 120
+LINE_MIN_DENSITY = 0.12
+LINE_CENTER_PENALTY = 0.18
+LINE_MEMORY_PENALTY = 0.45
 LINE_USE_SPARSE_RGB_FALLBACK = True
 LINE_SPARSE_STEP_X = 32
 LINE_SPARSE_STEP_Y = 16
@@ -59,9 +62,9 @@ LINE_RED_MIN = 80
 LINE_RED_DOMINANCE = 8
 LINE_ACCEPT_BGR_RED = True
 LINE_ROI_BANDS = [
-    (0.58, 0.10, 1.0),
-    (0.70, 0.10, 1.8),
-    (0.82, 0.10, 2.8),
+    (0.78, 0.98, 1.00),
+    (0.54, 0.72, 0.65),
+    (0.28, 0.46, 0.35),
 ]
 LINE_SMOOTH_ALPHA = 0.65
 LINE_LOST_RESET_FRAMES = 5
@@ -240,6 +243,8 @@ class LineTracker:
         self.lost_count = 0
         self.enabled = True
         self.error_reported = False
+        self.last_offset = 0.0
+        self.last_angle = 0.0
         self.last = self._empty_result()
 
     def _empty_result(self):
@@ -331,7 +336,7 @@ class LineTracker:
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
-            blob = self._find_best_blob(img_obj, rect)
+            blob = self._find_best_blob(img_obj, rect, self.frame_w * 0.5)
             if blob is None and LINE_USE_SPARSE_RGB_FALLBACK:
                 blob = self._sparse_red_blob(img_obj, rect)
             if blob is None:
@@ -361,6 +366,8 @@ class LineTracker:
         cy = int(sum_y / total_weight)
         err_x = cx - self.frame_w // 2
         angle = self._estimate_angle(points)
+        self.last_offset = float(err_x) / float(max(1, self.frame_w // 2)) * 100.0
+        self.last_angle = float(angle)
 
         result = {
             "seen": 1,
@@ -421,6 +428,21 @@ class LineTracker:
 
     def _get_rgb_pixel(self, img_obj, x, y):
         try:
+            shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                value = img_obj[0][y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+            if len(shape) == 3 and shape[0] == 3:
+                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
+            if len(shape) == 3 and shape[2] == 3:
+                value = img_obj[y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            pass
+
+        try:
             value = img_obj.get_pixel(x, y)
         except Exception:
             return None
@@ -461,7 +483,17 @@ class LineTracker:
             return False
         return True
 
-    def _find_best_blob(self, img_obj, rect):
+    def _blob_density(self, blob):
+        pixels = self._blob_area(blob, max(1, self._blob_rect(blob)[2]), max(1, self._blob_rect(blob)[3]))
+        try:
+            density = blob.density()
+            return float(density)
+        except Exception:
+            pass
+        _x, _y, w, h = self._blob_rect(blob)
+        return float(pixels) / float(max(1, w * h))
+
+    def _find_best_blob(self, img_obj, rect, frame_center_x):
         try:
             blobs = img_obj.find_blobs(
                 LINE_THRESHOLDS,
@@ -482,10 +514,20 @@ class LineTracker:
 
         best = None
         best_score = -1
+        x0, _y0, rw, _rh = rect
+        roi_center_x = x0 + rw * 0.5
+        predicted_x = frame_center_x + self.last_offset / 100.0 * frame_center_x
+        predicted_x = clamp(predicted_x, x0, x0 + rw)
         for blob in blobs:
             x, y, w, h = self._blob_rect(blob)
             area = self._blob_area(blob, w, h)
-            score = area + w * 3 + h
+            density = self._blob_density(blob)
+            if density < LINE_MIN_DENSITY:
+                continue
+            cx = x + w // 2
+            center_penalty = abs(cx - roi_center_x) * LINE_CENTER_PENALTY
+            memory_penalty = abs(cx - predicted_x) * LINE_MEMORY_PENALTY
+            score = area + w * 5 + h * 2 + density * 120 - center_penalty - memory_penalty
             if score > best_score:
                 best_score = score
                 best = blob
@@ -972,7 +1014,7 @@ def main():
     print("Model:", kmodel_path)
     print("Labels:", labels)
     print("Model type:", model_type)
-    print("Line mode: weighted ROI find_blobs")
+    print("Line mode: pipeline frame weighted ROI find_blobs")
 
     bridge = UartBridge()
     stabilizer = TargetStabilizer()
@@ -1023,7 +1065,7 @@ def main():
                 res = det_app.run(img)
                 line_result = None
                 if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
-                    line_result = line_tracker.update(img)
+                    line_result = line_tracker.update(pl.cur_frame)
                 else:
                     line_result = line_tracker.last
 
