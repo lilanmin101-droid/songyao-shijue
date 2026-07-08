@@ -102,8 +102,9 @@ UART_TX_PIN = 11
 UART_RX_PIN = 12
 LINE_SEND_EVERY_N_FRAMES = 1
 MV_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
-MULTI_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
+MULTI_SEND_EVERY_N_FRAMES = 2
 MULTI_MAX_CANDIDATES = 4
+MULTI_MIN_SCORE = SELECT_MIN_SCORE
 DISPLAY_EVERY_N_FRAMES = 2
 PRINT_PROTOCOL_WHEN_NO_UART = False
 GC_EVERY_N_FRAMES = 20
@@ -1126,8 +1127,26 @@ def build_line_payload(frame_id, line_result, fps):
     )
 
 
+def top_candidates(candidates, limit):
+    ordered = []
+    for cand in candidates:
+        if cand["score"] < MULTI_MIN_SCORE:
+            continue
+        inserted = False
+        for i in range(len(ordered)):
+            if cand["rank"] > ordered[i]["rank"]:
+                ordered.insert(i, cand)
+                inserted = True
+                break
+        if not inserted:
+            ordered.append(cand)
+        if len(ordered) > limit:
+            ordered.pop()
+    return ordered
+
+
 def build_multi_payload(frame_id, candidates, fps):
-    ordered = sorted(candidates, key=lambda item: item["rank"], reverse=True)
+    ordered = top_candidates(candidates, MULTI_MAX_CANDIDATES)
     count = min(MULTI_MAX_CANDIDATES, len(ordered))
     parts = ["ML", str(frame_id), str(count)]
     for i in range(count):
