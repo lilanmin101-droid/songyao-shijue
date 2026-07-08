@@ -59,8 +59,9 @@ DISTANCE_K_BY_HEIGHT = 90000
 
 # Line tracking. This follows Car_Mode's weighted multi-sensor idea:
 # a few fixed ROI "virtual sensors" find the line and report weighted error.
+# Each ROI band is (y_start_ratio, y_end_ratio, weight).
 ENABLE_LINE_TRACK = True
-LINE_DETECT_EVERY_N_FRAMES = 4
+LINE_DETECT_EVERY_N_FRAMES = 1
 LINE_THRESHOLDS = [(15, 100, 25, 127, -20, 90)]
 LINE_MIN_PIXELS = 160
 LINE_MIN_AREA = 120
@@ -68,8 +69,8 @@ LINE_MIN_DENSITY = 0.12
 LINE_CENTER_PENALTY = 0.18
 LINE_MEMORY_PENALTY = 0.45
 LINE_USE_SPARSE_RGB_FALLBACK = True
-LINE_SPARSE_STEP_X = 18
-LINE_SPARSE_STEP_Y = 14
+LINE_SPARSE_STEP_X = 24
+LINE_SPARSE_STEP_Y = 18
 LINE_SPARSE_MIN_HITS = 2
 LINE_RED_MIN = 90
 LINE_RED_DOMINANCE = 38
@@ -79,11 +80,10 @@ LINE_RED_CLUSTER_GAP = 42
 LINE_RED_MAX_CLUSTER_WIDTH_RATIO = 0.22
 LINE_ACCEPT_BGR_RED = False
 LINE_ROI_BANDS = [
-    (0.78, 0.98, 1.00),
-    (0.54, 0.72, 0.65),
-    (0.28, 0.46, 0.35),
+    (0.76, 0.98, 1.00),
+    (0.52, 0.70, 0.55),
 ]
-LINE_SMOOTH_ALPHA = 0.65
+LINE_SMOOTH_ALPHA = 0.90
 LINE_LOST_RESET_FRAMES = 5
 DRAW_LINE_ROIS = True
 
@@ -329,13 +329,18 @@ class LineTracker:
     def _build_rois(self):
         rois = []
         for band in LINE_ROI_BANDS:
-            y_ratio, h_ratio, weight = band
-            y = int(self.frame_h * y_ratio)
-            h = int(self.frame_h * h_ratio)
+            y0_ratio, y1_ratio, weight = band
+            y = int(self.frame_h * y0_ratio)
+            y_end = int(self.frame_h * y1_ratio)
             if y < 0:
                 y = 0
-            if y + h > self.frame_h:
-                h = self.frame_h - y
+            if y > self.frame_h:
+                y = self.frame_h
+            if y_end < 0:
+                y_end = 0
+            if y_end > self.frame_h:
+                y_end = self.frame_h
+            h = y_end - y
             if h <= 0:
                 continue
             rois.append({
@@ -1224,6 +1229,9 @@ def main():
                     line_result["src"] = "ai"
                 else:
                     line_result = line_tracker.last
+                if frame_id % SEND_EVERY_N_FRAMES == 0:
+                    line_payload = build_line_payload(frame_id, line_result, fps)
+                    bridge.write_packet(line_payload)
                 res = det_app.run(img)
 
                 candidates = result_to_candidates(res, labels)
@@ -1233,8 +1241,6 @@ def main():
                 if frame_id % SEND_EVERY_N_FRAMES == 0:
                     payload = build_payload(frame_id, runtime_target, selected, locked, hits, fps)
                     bridge.write_packet(payload)
-                    line_payload = build_line_payload(frame_id, line_result, fps)
-                    bridge.write_packet(line_payload)
 
                 draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
                 pl.show_image()
