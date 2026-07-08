@@ -69,12 +69,15 @@ LINE_MIN_AREA = 120
 LINE_MIN_DENSITY = 0.12
 LINE_CENTER_PENALTY = 0.18
 LINE_MEMORY_PENALTY = 0.45
+LINE_TRY_FIND_BLOBS = False
 LINE_USE_SPARSE_RGB_FALLBACK = True
 LINE_FAST_ROW_SCAN = True
 LINE_FAST_ROWS_PER_BAND = 3
 LINE_SPARSE_STEP_X = 20
 LINE_SPARSE_STEP_Y = 18
 LINE_SPARSE_MIN_HITS = 2
+LINE_TRACK_WINDOW_RATIO = 0.38
+LINE_TRACK_WINDOW_MIN = 260
 LINE_RED_MIN = 90
 LINE_RED_DOMINANCE = 38
 LINE_RED_MAX_GREEN = 145
@@ -101,6 +104,7 @@ MV_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
 DISPLAY_EVERY_N_FRAMES = 1
 PRINT_PROTOCOL_WHEN_NO_UART = False
 GC_EVERY_N_FRAMES = 20
+FAST_DISPLAY = True
 
 # If the model is noisy in your venue, raise to 0.48-0.55.
 CONFIDENCE_THRESHOLD_OVERRIDE = None
@@ -374,7 +378,7 @@ class LineTracker:
         for roi_def in self.rois:
             rect = roi_def["rect"]
             weight = roi_def["weight"]
-            if self._has_find_blobs(img_obj):
+            if LINE_TRY_FIND_BLOBS and self._has_find_blobs(img_obj):
                 blob = self._find_best_blob(img_obj, rect, self.frame_w * 0.5)
                 if blob is not None:
                     self.debug_blob_hits += 1
@@ -442,14 +446,14 @@ class LineTracker:
 
     def _sparse_red_blob(self, img_obj, rect, frame_center_x):
         x0, y0, rw, rh = rect
-        x1 = x0 + rw
+        x_scan0, x_scan1 = self._tracking_x_window(x0, rw)
         y1 = y0 + rh
         hits = []
 
         layout = self._rgb_layout(img_obj)
         y_values = self._sample_rows(y0, y1)
         for y in y_values:
-            for x in range(x0, x1, LINE_SPARSE_STEP_X):
+            for x in range(x_scan0, x_scan1, LINE_SPARSE_STEP_X):
                 pixel = self._get_rgb_pixel_fast(img_obj, layout, x, y)
                 if pixel is None:
                     return None
@@ -473,6 +477,31 @@ class LineTracker:
         h = max(LINE_SPARSE_STEP_Y, max_y - min_y + LINE_SPARSE_STEP_Y)
         area = count * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
         return (cx - w // 2, cy - h // 2, w, h, area)
+
+    def _tracking_x_window(self, x0, rw):
+        x1 = x0 + rw
+        if self.last is None or not self.last.get("seen", 0):
+            return x0, x1
+        center = int(self.last.get("cx", self.frame_w // 2))
+        width = int(rw * LINE_TRACK_WINDOW_RATIO)
+        if width < LINE_TRACK_WINDOW_MIN:
+            width = LINE_TRACK_WINDOW_MIN
+        if width > rw:
+            width = rw
+        half = width // 2
+        sx0 = center - half
+        sx1 = center + half
+        if sx0 < x0:
+            sx1 += x0 - sx0
+            sx0 = x0
+        if sx1 > x1:
+            sx0 -= sx1 - x1
+            sx1 = x1
+        if sx0 < x0:
+            sx0 = x0
+        if sx1 <= sx0:
+            return x0, x1
+        return sx0, sx1
 
     def _sample_rows(self, y0, y1):
         if not LINE_FAST_ROW_SCAN:
@@ -1139,6 +1168,8 @@ def draw_line_overlay(draw_img, line_result, display_size):
             draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
 
     if not line_result["seen"]:
+        if FAST_DISPLAY:
+            return
         text = "LINE LOST src:%s b:%d r:%d/%d" % (
             line_result.get("src", "?"),
             line_result.get("blob_hits", 0),
@@ -1151,6 +1182,9 @@ def draw_line_overlay(draw_img, line_result, display_size):
     lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
     draw_img.draw_circle(lx, ly, 7, color=COLOR_LINE, fill=True)
     draw_img.draw_line(display_size[0] // 2, display_size[1], lx, ly, color=COLOR_LINE, thickness=3)
+
+    if FAST_DISPLAY:
+        return
 
     for point in line_result["points"]:
         px, py = scale_xy(point[0], point[1], display_size, source_size)
@@ -1174,9 +1208,13 @@ def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, d
     center_tol = int(dw * CENTER_TOLERANCE_RATIO)
 
     draw_img.draw_line(cx, 0, cx, dh, color=COLOR_GUIDE, thickness=1)
-    draw_img.draw_line(cx - center_tol, dh - 70, cx - center_tol, dh, color=COLOR_GUIDE, thickness=2)
-    draw_img.draw_line(cx + center_tol, dh - 70, cx + center_tol, dh, color=COLOR_GUIDE, thickness=2)
+    if not FAST_DISPLAY:
+        draw_img.draw_line(cx - center_tol, dh - 70, cx - center_tol, dh, color=COLOR_GUIDE, thickness=2)
+        draw_img.draw_line(cx + center_tol, dh - 70, cx + center_tol, dh, color=COLOR_GUIDE, thickness=2)
     draw_line_overlay(draw_img, line_result, display_size)
+
+    if FAST_DISPLAY:
+        return
 
     selected_id = -1
     if selected is not None:
