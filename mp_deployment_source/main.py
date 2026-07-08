@@ -1,34 +1,46 @@
-import os
 import gc
+import math
+import os
 import time
 
-from libs.PlatTasks import DetectionApp
-from libs.PipeLine import PipeLine
-from libs.Utils import *
+try:
+    import ujson as json
+except Exception:
+    import json
+
+from media.sensor import Sensor
+from media.display import Display
+from media.media import MediaManager
 
 
 # =========================
-# Match-day configuration
+# Combined snapshot pipeline
 # =========================
 
-# Put this file, deploy_config.json and the kmodel under this directory on K230.
 ROOT_PATH = "/sdcard/mp_deployment_source/"
 
-# lcd is the usual LCKFB/JLC K230 screen. Use "hdmi" or "lt9611" for HDMI.
-DISPLAY_MODE = "lcd"
-DISPLAY_SIZE = None
+# Keep this equal to the line-debug program that already worked.
+CAM_WIDTH = 480
+CAM_HEIGHT = 272
 
-# 1280x720 gives the detector more pixels before resize. For more FPS, try [640, 360].
-RGB888P_SIZE = [1280, 720]
+# Use "virt" for CanMV IDE preview. Use "lcd" on the real ST7701 screen.
+DISPLAY_MODE = "virt"
+DISPLAY_WIDTH = CAM_WIDTH
+DISPLAY_HEIGHT = CAM_HEIGHT
+SHOW_UI = True
+
 CAMERA_FPS = 30
-SENSOR_ID = None
-HMIRROR = None
-VFLIP = None
+HMIRROR = False
+VFLIP = False
 
-# 0 means auto-pick the best visible drug room. Send T1..T8 by UART to select.
+# Digit detector. It runs every few frames so line tracking stays responsive.
+ENABLE_DIGIT_DETECT = True
+DIGIT_DETECT_EVERY_N_FRAMES = 3
+CONFIDENCE_THRESHOLD_OVERRIDE = None
+NMS_THRESHOLD_OVERRIDE = None
+
+# Target selection.
 DEFAULT_TARGET_ID = 0
-
-# Selection and lock tuning.
 SELECT_MIN_SCORE = 0.45
 MIN_BOX_AREA_RATIO = 0.00020
 HISTORY_SIZE = 7
@@ -36,41 +48,28 @@ LOCK_MIN_HITS = 4
 LOST_RESET_FRAMES = 5
 SMOOTH_ALPHA = 0.62
 
-# Delivery decision. The car should stop when state == 3.
 CENTER_TOLERANCE_RATIO = 0.045
 ARRIVE_BOX_HEIGHT_RATIO = 0.35
+DISTANCE_K_BY_HEIGHT = 35000
 
-# Optional rough distance estimate: distance_mm ~= DISTANCE_K_BY_HEIGHT / box_h_px.
-# Calibrate it on your car. Example: at 1000 mm, box height is 90 px -> K = 90000.
-DISTANCE_K_BY_HEIGHT = 90000
-
-# Line tracking. This follows Car_Mode's weighted multi-sensor idea:
-# a few fixed ROI "virtual sensors" find the line and report weighted error.
-ENABLE_LINE_TRACK = False
-LINE_DETECT_EVERY_N_FRAMES = 3
-LINE_THRESHOLDS = [(15, 100, 25, 127, -20, 90)]
-LINE_MIN_PIXELS = 160
-LINE_MIN_AREA = 120
-LINE_MIN_DENSITY = 0.12
-LINE_CENTER_PENALTY = 0.18
-LINE_MEMORY_PENALTY = 0.45
-LINE_USE_SPARSE_RGB_FALLBACK = True
-LINE_SPARSE_STEP_X = 32
-LINE_SPARSE_STEP_Y = 16
-LINE_SPARSE_MIN_HITS = 1
-LINE_RED_MIN = 80
-LINE_RED_DOMINANCE = 0
-LINE_ACCEPT_BGR_RED = True
+# Line tracking. These values are copied from the working line_debug_main.py.
+LINE_THRESHOLD = [(15, 100, 25, 127, -20, 90)]
 LINE_ROI_BANDS = [
     (0.78, 0.98, 1.00),
     (0.54, 0.72, 0.65),
     (0.28, 0.46, 0.35),
 ]
-LINE_SMOOTH_ALPHA = 0.65
-LINE_LOST_RESET_FRAMES = 5
-DRAW_LINE_ROIS = True
+LINE_MIN_PIXELS = 160
+LINE_MIN_AREA = 120
+LINE_MIN_DENSITY = 0.12
+LINE_CENTER_PENALTY = 0.18
+LINE_MEMORY_PENALTY = 0.45
+OFFSET_FULL_SCALE = 100
+OFFSET_FILTER_ALPHA = 0.55
+ANGLE_FILTER_ALPHA = 0.55
+LOST_HOLD_FRAMES = 6
 
-# UART protocol output. Official examples commonly use UART2 on pins 11/12.
+# UART text protocol, compatible with the original main.py packet style.
 USE_UART = True
 UART_ID = 2
 UART_BAUDRATE = 115200
@@ -79,23 +78,44 @@ UART_RX_PIN = 12
 SEND_EVERY_N_FRAMES = 1
 PRINT_PROTOCOL_WHEN_NO_UART = True
 
-# If the model is noisy in your venue, raise to 0.48-0.55.
-CONFIDENCE_THRESHOLD_OVERRIDE = None
-NMS_THRESHOLD_OVERRIDE = None
-
-# Debug timing prints every frame when set to 1.
 DEBUG_MODE = 0
-PROFILE_TOTAL = 0
 
 
-COLOR_NORMAL = (255, 0, 180, 255)
-COLOR_TARGET = (255, 0, 255, 0)
-COLOR_LOCKED = (255, 255, 40, 40)
-COLOR_GUIDE = (160, 255, 255, 255)
-COLOR_TEXT = (255, 255, 255, 255)
-COLOR_WARN = (255, 255, 220, 0)
-COLOR_LINE = (255, 40, 220, 40)
-COLOR_LINE_ROI = (120, 255, 255, 0)
+WHITE = (255, 255, 255)
+GRAY = (120, 120, 120)
+GREEN = (0, 220, 0)
+RED = (255, 0, 0)
+YELLOW = (255, 220, 0)
+MAGENTA = (255, 0, 220)
+CYAN = (0, 220, 255)
+
+
+def ticks_ms():
+    if hasattr(time, "ticks_ms"):
+        return time.ticks_ms()
+    return int(time.time() * 1000)
+
+
+def ticks_diff(a, b):
+    if hasattr(time, "ticks_diff"):
+        return time.ticks_diff(a, b)
+    return a - b
+
+
+def check_exitpoint():
+    try:
+        if hasattr(os, "exitpoint"):
+            os.exitpoint()
+    except Exception:
+        pass
+
+
+def print_exception(exc):
+    try:
+        import sys
+        sys.print_exception(exc)
+    except Exception:
+        print(exc)
 
 
 def join_path(root, name):
@@ -116,7 +136,8 @@ def load_deploy_config():
     config_path = join_path(ROOT_PATH, "deploy_config.json")
     if not file_exists(config_path):
         config_path = "deploy_config.json"
-    return read_json(config_path), config_path
+    with open(config_path, "r") as f:
+        return json.load(f), config_path
 
 
 def resolve_model_path(model_name):
@@ -136,6 +157,41 @@ def flatten_anchors(deploy_conf, model_type):
     return anchors
 
 
+def align_up(value, align):
+    return (value + align - 1) // align * align
+
+
+def center_pad_param(src_size, dst_size):
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    if src_w * dst_h >= src_h * dst_w:
+        padded_h = int(src_w * dst_h / dst_w)
+        pad_h = max(0, padded_h - src_h)
+        top = pad_h // 2
+        bottom = pad_h - top
+        return top, bottom, 0, 0
+    padded_w = int(src_h * dst_w / dst_h)
+    pad_w = max(0, padded_w - src_w)
+    left = pad_w // 2
+    right = pad_w - left
+    return 0, 0, left, right
+
+
+def clip(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def value(obj, name, default=0):
+    attr = getattr(obj, name, None)
+    if attr is None:
+        return default
+    return attr() if callable(attr) else attr
+
+
 def label_to_id(label):
     try:
         return int(label)
@@ -143,19 +199,289 @@ def label_to_id(label):
         return -1
 
 
-def clamp(value, low, high):
-    if value < low:
-        return low
-    if value > high:
-        return high
-    return value
-
-
 def clone_candidate(src):
     dst = {}
     for key in src:
         dst[key] = src[key]
     return dst
+
+
+class LineResult:
+    def __init__(self):
+        self.valid = False
+        self.offset = 0
+        self.angle = 0
+        self.lost_frames = 0
+        self.quality = 0
+        self.width_ratio = 0
+        self.cx = CAM_WIDTH // 2
+        self.cy = 0
+        self.width = 0
+        self.area = 0
+        self.bands = []
+
+
+class LineTracker:
+    def __init__(self):
+        self.last_offset = 0.0
+        self.last_angle = 0.0
+        self.lost_frames = 0
+
+    def process(self, img):
+        result = LineResult()
+        w = img.width()
+        h = img.height()
+        center_x = w * 0.5
+
+        centers = []
+        near = None
+        far = None
+        widest = 0
+        area_total = 0
+
+        for idx, band in enumerate(LINE_ROI_BANDS):
+            y0r, y1r, weight = band
+            y0 = int(y0r * h)
+            bh = max(1, int((y1r - y0r) * h))
+            roi = (0, y0, w, bh)
+            blob = self._best_line_blob(img, roi, center_x)
+
+            if blob is None:
+                result.bands.append((None, y0 + bh // 2, 0, roi))
+                continue
+
+            cx = value(blob, "cx")
+            cy = value(blob, "cy")
+            bw = value(blob, "w")
+            pixels = value(blob, "pixels")
+            density = self._blob_density(blob)
+            result.bands.append((cx, cy, bw, roi))
+            widest = max(widest, bw)
+            area_total += pixels
+
+            centers.append((cx, cy, weight, pixels, density))
+            if idx == 0:
+                near = (cx, cy)
+            if idx == len(LINE_ROI_BANDS) - 1:
+                far = (cx, cy)
+
+        if centers:
+            weighted = 0.0
+            total = 0.0
+            y_weighted = 0.0
+            for cx, cy, weight, _pixels, _density in centers:
+                weighted += cx * weight
+                y_weighted += cy * weight
+                total += weight
+            raw_cx = weighted / total
+            raw_offset = (raw_cx - center_x) / center_x * OFFSET_FULL_SCALE
+
+            raw_angle = self.last_angle
+            if near is not None and far is not None:
+                dx = far[0] - near[0]
+                dy = abs(near[1] - far[1])
+                if dy > 1:
+                    raw_angle = math.degrees(math.atan2(dx, dy))
+            elif len(centers) >= 2:
+                bottom = centers[0]
+                top = centers[-1]
+                dx = top[0] - bottom[0]
+                dy = abs(bottom[1] - top[1])
+                if dy > 1:
+                    raw_angle = math.degrees(math.atan2(dx, dy))
+
+            self.last_offset = OFFSET_FILTER_ALPHA * raw_offset + (1.0 - OFFSET_FILTER_ALPHA) * self.last_offset
+            self.last_angle = ANGLE_FILTER_ALPHA * raw_angle + (1.0 - ANGLE_FILTER_ALPHA) * self.last_angle
+            self.lost_frames = 0
+            result.valid = True
+            result.quality = self._line_quality(centers, near is not None)
+            result.cx = int(raw_cx)
+            result.cy = int(y_weighted / total)
+        else:
+            self.lost_frames += 1
+            result.valid = self.lost_frames <= LOST_HOLD_FRAMES
+            result.quality = max(0, 35 - self.lost_frames * 10) if result.valid else 0
+            result.cx = int(center_x + self.last_offset / OFFSET_FULL_SCALE * center_x)
+            result.cy = int(h * 0.85)
+
+        result.offset = int(clip(self.last_offset, -100, 100))
+        result.angle = int(clip(self.last_angle, -90, 90))
+        result.lost_frames = self.lost_frames
+        result.width_ratio = int(clip(widest * 100 / max(1, w), 0, 100))
+        result.width = widest
+        result.area = area_total
+        return result
+
+    def _blob_density(self, blob):
+        pixels = value(blob, "pixels")
+        bw = max(1, value(blob, "w"))
+        bh = max(1, value(blob, "h"))
+        return value(blob, "density", float(pixels) / float(bw * bh))
+
+    def _line_quality(self, centers, has_near):
+        band_score = min(100, int(len(centers) * 100 / max(1, len(LINE_ROI_BANDS))))
+        density_avg = 0.0
+        for _cx, _cy, _weight, _pixels, density in centers:
+            density_avg += density
+        density_avg /= max(1, len(centers))
+        density_score = int(clip(density_avg * 160, 0, 100))
+        near_bonus = 20 if has_near else -20
+        return int(clip(band_score * 0.55 + density_score * 0.45 + near_bonus, 0, 100))
+
+    def _best_line_blob(self, img, roi, frame_center_x):
+        blobs = img.find_blobs(
+            LINE_THRESHOLD,
+            roi=roi,
+            pixels_threshold=LINE_MIN_PIXELS,
+            area_threshold=LINE_MIN_AREA,
+            merge=True,
+        )
+        if not blobs:
+            return None
+
+        best = None
+        best_score = -1
+        x0, _y0, rw, _rh = roi
+        roi_center_x = x0 + rw * 0.5
+        predicted_x = frame_center_x + self.last_offset / OFFSET_FULL_SCALE * frame_center_x
+        predicted_x = clip(predicted_x, x0, x0 + rw)
+        for blob in blobs:
+            pixels = value(blob, "pixels")
+            bw = max(1, value(blob, "w"))
+            bh = max(1, value(blob, "h"))
+            cx = value(blob, "cx")
+            density = self._blob_density(blob)
+            if density < LINE_MIN_DENSITY:
+                continue
+            center_penalty = abs(cx - roi_center_x) * LINE_CENTER_PENALTY
+            memory_penalty = abs(cx - predicted_x) * LINE_MEMORY_PENALTY
+            score = pixels + bw * 5 + bh * 2 + density * 120 - center_penalty - memory_penalty
+            if score > best_score:
+                best = blob
+                best_score = score
+        return best
+
+
+class SnapshotAnchorDetector:
+    def __init__(self, deploy_conf):
+        import nncase_runtime as nn
+        import ulab.numpy as np
+        import aicube
+
+        self.nn = nn
+        self.np = np
+        self.aicube = aicube
+        self.labels = deploy_conf["categories"]
+        self.model_type = deploy_conf["model_type"]
+        self.model_input_size = deploy_conf["img_size"]
+        self.anchors = flatten_anchors(deploy_conf, self.model_type)
+        self.strides = [8, 16, 32]
+        self.confidence_threshold = deploy_conf["confidence_threshold"]
+        self.nms_threshold = deploy_conf["nms_threshold"]
+        self.nms_option = deploy_conf.get("nms_option", False)
+
+        if CONFIDENCE_THRESHOLD_OVERRIDE is not None:
+            self.confidence_threshold = CONFIDENCE_THRESHOLD_OVERRIDE
+        if NMS_THRESHOLD_OVERRIDE is not None:
+            self.nms_threshold = NMS_THRESHOLD_OVERRIDE
+
+        self.rgb_size = [align_up(CAM_WIDTH, 16), CAM_HEIGHT]
+        self.kmodel_path = resolve_model_path(deploy_conf["kmodel_path"])
+        self.kpu = nn.kpu()
+        self.kpu.load_kmodel(self.kmodel_path)
+        self.ai2d = nn.ai2d()
+        self.ai2d.set_dtype(nn.ai2d_format.NCHW_FMT, nn.ai2d_format.NCHW_FMT, np.uint8, np.uint8)
+        top, bottom, left, right = center_pad_param(self.rgb_size, self.model_input_size)
+        self.ai2d.set_pad_param(True, [0, 0, 0, 0, top, bottom, left, right], 0, [114, 114, 114])
+        self.ai2d.set_resize_param(True, nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
+
+        out = np.ones((1, 3, self.model_input_size[1], self.model_input_size[0]), dtype=np.uint8)
+        self.ai2d_output_tensor = nn.from_numpy(out)
+        self.builder = None
+        self.builder_shape = None
+        print("Digit model:", self.kmodel_path)
+        print("Digit labels:", self.labels)
+
+    def detect(self, img):
+        nchw = self._image_to_nchw(img)
+        if nchw is None:
+            return []
+
+        in_shape = nchw.shape
+        if self.builder is None or self.builder_shape != in_shape:
+            self.builder = self.ai2d.build(
+                [1, 3, in_shape[2], in_shape[3]],
+                [1, 3, self.model_input_size[1], self.model_input_size[0]],
+            )
+            self.builder_shape = in_shape
+
+        input_tensor = self.nn.from_numpy(nchw)
+        self.builder.run(input_tensor, self.ai2d_output_tensor)
+        self.kpu.set_input_tensor(0, self.ai2d_output_tensor)
+        self.kpu.run()
+
+        results = []
+        for i in range(self.kpu.outputs_size()):
+            out = self.kpu.get_output_tensor(i)
+            results.append(out.to_numpy())
+            del out
+
+        del input_tensor
+        return self._postprocess(results)
+
+    def _image_to_nchw(self, img):
+        try:
+            rgb = img.to_rgb888()
+        except Exception:
+            rgb = img
+        try:
+            arr = rgb.to_numpy_ref()
+        except Exception as exc:
+            print("digit to_numpy_ref failed:", exc)
+            return None
+
+        shape = arr.shape
+        if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+            return arr
+        if len(shape) == 3 and shape[0] == 3:
+            return arr.reshape((1, shape[0], shape[1], shape[2]))
+        if len(shape) == 3 and shape[2] == 3:
+            flat = arr.reshape((shape[0] * shape[1], shape[2]))
+            trans = flat.transpose()
+            copied = trans.copy()
+            return copied.reshape((1, shape[2], shape[0], shape[1]))
+        print("unsupported digit image shape:", shape)
+        return None
+
+    def _postprocess(self, results):
+        if not results or len(results) < 3:
+            return []
+        if self.model_type == "AnchorBaseDet":
+            return self.aicube.anchorbasedet_post_process(
+                results[0],
+                results[1],
+                results[2],
+                self.model_input_size,
+                self.rgb_size,
+                self.strides,
+                len(self.labels),
+                self.confidence_threshold,
+                self.nms_threshold,
+                self.anchors,
+                self.nms_option,
+            )
+        print("unsupported model type:", self.model_type)
+        return []
+
+    def deinit(self):
+        try:
+            del self.builder
+            del self.ai2d_output_tensor
+            del self.ai2d
+            del self.kpu
+            self.nn.shrink_memory_pool()
+        except Exception:
+            pass
 
 
 class TargetStabilizer:
@@ -204,406 +530,6 @@ class TargetStabilizer:
             self.smooth[key] = self.smooth[key] * b + candidate[key] * a
         self.smooth["label"] = candidate["label"]
         self.smooth["drug_id"] = candidate["drug_id"]
-
-
-class FpsMeter:
-    def __init__(self):
-        self.last_ms = self._ticks_ms()
-        self.count = 0
-        self.fps = 0
-
-    def _ticks_ms(self):
-        try:
-            return time.ticks_ms()
-        except Exception:
-            return int(time.time() * 1000)
-
-    def _diff_ms(self, now, old):
-        try:
-            return time.ticks_diff(now, old)
-        except Exception:
-            return now - old
-
-    def update(self):
-        self.count += 1
-        now = self._ticks_ms()
-        diff = self._diff_ms(now, self.last_ms)
-        if diff >= 1000:
-            self.fps = int(self.count * 1000 / diff)
-            self.count = 0
-            self.last_ms = now
-        return self.fps
-
-
-class LineTracker:
-    def __init__(self, frame_size):
-        self.frame_w = frame_size[0]
-        self.frame_h = frame_size[1]
-        self.rois = self._build_rois()
-        self.lost_count = 0
-        self.enabled = True
-        self.error_reported = False
-        self.last_offset = 0.0
-        self.last_angle = 0.0
-        self.debug_blob_hits = 0
-        self.debug_red_hits = 0
-        self.debug_sample_count = 0
-        self.last = self._empty_result()
-
-    def _empty_result(self):
-        return {
-            "seen": 0,
-            "err_x": 0,
-            "angle": 0,
-            "cx": self.frame_w // 2,
-            "cy": 0,
-            "width": 0,
-            "area": 0,
-            "points": [],
-            "rois": self.rois,
-            "frame_w": self.frame_w,
-            "frame_h": self.frame_h,
-            "blob_hits": self.debug_blob_hits,
-            "red_hits": self.debug_red_hits,
-            "sample_count": self.debug_sample_count,
-        }
-
-    def _ensure_frame_size(self, img_obj):
-        size = self._infer_frame_size(img_obj)
-        if size is None:
-            return
-        w, h = size
-        if w <= 0 or h <= 0:
-            return
-        if w == self.frame_w and h == self.frame_h:
-            return
-        self.frame_w = w
-        self.frame_h = h
-        self.rois = self._build_rois()
-        print("Line frame size:", self.frame_w, self.frame_h)
-
-    def _infer_frame_size(self, img_obj):
-        try:
-            shape = img_obj.shape
-            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
-                return int(shape[3]), int(shape[2])
-            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
-                return int(shape[2]), int(shape[1])
-            if len(shape) == 3 and shape[0] == 3:
-                return int(shape[2]), int(shape[1])
-            if len(shape) == 3 and shape[2] == 3:
-                return int(shape[1]), int(shape[0])
-            if len(shape) == 2:
-                return int(shape[1]), int(shape[0])
-        except Exception:
-            pass
-
-        try:
-            return int(img_obj.width()), int(img_obj.height())
-        except Exception:
-            pass
-
-        try:
-            return int(img_obj.width), int(img_obj.height)
-        except Exception:
-            return None
-
-    def _build_rois(self):
-        rois = []
-        for band in LINE_ROI_BANDS:
-            y_ratio, h_ratio, weight = band
-            y = int(self.frame_h * y_ratio)
-            h = int(self.frame_h * h_ratio)
-            if y < 0:
-                y = 0
-            if y + h > self.frame_h:
-                h = self.frame_h - y
-            if h <= 0:
-                continue
-            rois.append({
-                "rect": (0, y, self.frame_w, h),
-                "weight": weight,
-            })
-        return rois
-
-    def update(self, img_obj):
-        if not ENABLE_LINE_TRACK or not self.enabled or img_obj is None:
-            self.last = self._empty_result()
-            return self.last
-
-        self._ensure_frame_size(img_obj)
-        points = []
-        total_weight = 0.0
-        sum_x = 0.0
-        sum_y = 0.0
-        sum_area = 0
-        max_width = 0
-        self.debug_blob_hits = 0
-        self.debug_red_hits = 0
-        self.debug_sample_count = 0
-
-        for roi_def in self.rois:
-            rect = roi_def["rect"]
-            weight = roi_def["weight"]
-            blob = self._find_best_blob(img_obj, rect, self.frame_w * 0.5)
-            if blob is not None:
-                self.debug_blob_hits += 1
-            if blob is None and LINE_USE_SPARSE_RGB_FALLBACK:
-                blob = self._sparse_red_blob(img_obj, rect)
-            if blob is None:
-                continue
-            x, y, w, h = self._blob_rect(blob)
-            cx = x + w // 2
-            cy = y + h // 2
-            area = self._blob_area(blob, w, h)
-            points.append((cx, cy, w, h, area, rect))
-            sum_x += cx * weight
-            sum_y += cy * weight
-            total_weight += weight
-            sum_area += area
-            if w > max_width:
-                max_width = w
-
-        if total_weight <= 0:
-            self.lost_count += 1
-            if self.lost_count >= LINE_LOST_RESET_FRAMES:
-                self.last = self._empty_result()
-            else:
-                self.last["seen"] = 0
-                self.last["blob_hits"] = self.debug_blob_hits
-                self.last["red_hits"] = self.debug_red_hits
-                self.last["sample_count"] = self.debug_sample_count
-            return self.last
-
-        self.lost_count = 0
-        cx = int(sum_x / total_weight)
-        cy = int(sum_y / total_weight)
-        err_x = cx - self.frame_w // 2
-        angle = self._estimate_angle(points)
-        self.last_offset = float(err_x) / float(max(1, self.frame_w // 2)) * 100.0
-        self.last_angle = float(angle)
-
-        result = {
-            "seen": 1,
-            "err_x": err_x,
-            "angle": angle,
-            "cx": cx,
-            "cy": cy,
-            "width": max_width,
-            "area": sum_area,
-            "points": points,
-            "rois": self.rois,
-            "frame_w": self.frame_w,
-            "frame_h": self.frame_h,
-            "blob_hits": self.debug_blob_hits,
-            "red_hits": self.debug_red_hits,
-            "sample_count": self.debug_sample_count,
-        }
-        self.last = self._smooth(result)
-        return self.last
-
-    def _sparse_red_blob(self, img_obj, rect):
-        x0, y0, rw, rh = rect
-        x1 = x0 + rw
-        y1 = y0 + rh
-        hits = 0
-        sum_x = 0
-        sum_y = 0
-        min_x = x1
-        min_y = y1
-        max_x = x0
-        max_y = y0
-
-        for y in range(y0, y1, LINE_SPARSE_STEP_Y):
-            for x in range(x0, x1, LINE_SPARSE_STEP_X):
-                pixel = self._get_rgb_pixel(img_obj, x, y)
-                if pixel is None:
-                    return None
-                self.debug_sample_count += 1
-                r, g, b = pixel
-                if self._is_red_pixel(r, g, b):
-                    self.debug_red_hits += 1
-                    hits += 1
-                    sum_x += x
-                    sum_y += y
-                    if x < min_x:
-                        min_x = x
-                    if y < min_y:
-                        min_y = y
-                    if x > max_x:
-                        max_x = x
-                    if y > max_y:
-                        max_y = y
-
-        if hits < LINE_SPARSE_MIN_HITS:
-            return None
-
-        cx = int(sum_x / hits)
-        cy = int(sum_y / hits)
-        w = max(LINE_SPARSE_STEP_X, max_x - min_x + LINE_SPARSE_STEP_X)
-        h = max(LINE_SPARSE_STEP_Y, max_y - min_y + LINE_SPARSE_STEP_Y)
-        area = hits * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
-        return (cx - w // 2, cy - h // 2, w, h, area)
-
-    def _get_rgb_pixel(self, img_obj, x, y):
-        try:
-            shape = img_obj.shape
-            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
-                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
-            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
-                value = img_obj[0][y][x]
-                return int(value[0]), int(value[1]), int(value[2])
-            if len(shape) == 3 and shape[0] == 3:
-                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
-            if len(shape) == 3 and shape[2] == 3:
-                value = img_obj[y][x]
-                return int(value[0]), int(value[1]), int(value[2])
-        except Exception:
-            pass
-
-        try:
-            value = img_obj.get_pixel(x, y)
-        except Exception:
-            return None
-
-        try:
-            if len(value) >= 3:
-                return int(value[0]), int(value[1]), int(value[2])
-        except Exception:
-            pass
-
-        try:
-            raw = int(value)
-            if raw <= 0xFFFF:
-                r = ((raw >> 11) & 0x1F) << 3
-                g = ((raw >> 5) & 0x3F) << 2
-                b = (raw & 0x1F) << 3
-            else:
-                r = (raw >> 16) & 0xFF
-                g = (raw >> 8) & 0xFF
-                b = raw & 0xFF
-            return r, g, b
-        except Exception:
-            return None
-
-    def _is_red_pixel(self, r, g, b):
-        if self._is_red_order(r, g, b):
-            return True
-        if LINE_ACCEPT_BGR_RED and self._is_red_order(b, g, r):
-            return True
-        return False
-
-    def _is_red_order(self, r, g, b):
-        if r < LINE_RED_MIN:
-            return False
-        if r < g + LINE_RED_DOMINANCE:
-            return False
-        if r < b + LINE_RED_DOMINANCE:
-            return False
-        return True
-
-    def _blob_density(self, blob):
-        pixels = self._blob_area(blob, max(1, self._blob_rect(blob)[2]), max(1, self._blob_rect(blob)[3]))
-        try:
-            density = blob.density()
-            return float(density)
-        except Exception:
-            pass
-        _x, _y, w, h = self._blob_rect(blob)
-        return float(pixels) / float(max(1, w * h))
-
-    def _find_best_blob(self, img_obj, rect, frame_center_x):
-        try:
-            blobs = img_obj.find_blobs(
-                LINE_THRESHOLDS,
-                roi=rect,
-                pixels_threshold=LINE_MIN_PIXELS,
-                area_threshold=LINE_MIN_AREA,
-                merge=True,
-            )
-        except TypeError:
-            try:
-                blobs = img_obj.find_blobs(LINE_THRESHOLDS, roi=rect, pixels_threshold=LINE_MIN_PIXELS)
-            except Exception as e:
-                self._report_find_blobs_error(e)
-                return None
-        except Exception as e:
-            self._report_find_blobs_error(e)
-            return None
-
-        best = None
-        best_score = -1
-        x0, _y0, rw, _rh = rect
-        roi_center_x = x0 + rw * 0.5
-        predicted_x = frame_center_x + self.last_offset / 100.0 * frame_center_x
-        predicted_x = clamp(predicted_x, x0, x0 + rw)
-        for blob in blobs:
-            x, y, w, h = self._blob_rect(blob)
-            area = self._blob_area(blob, w, h)
-            density = self._blob_density(blob)
-            if density < LINE_MIN_DENSITY:
-                continue
-            cx = x + w // 2
-            center_penalty = abs(cx - roi_center_x) * LINE_CENTER_PENALTY
-            memory_penalty = abs(cx - predicted_x) * LINE_MEMORY_PENALTY
-            score = area + w * 5 + h * 2 + density * 120 - center_penalty - memory_penalty
-            if score > best_score:
-                best_score = score
-                best = blob
-        return best
-
-    def _report_find_blobs_error(self, error):
-        if not self.error_reported:
-            print("line find_blobs unavailable, using sparse RGB fallback:", error)
-            self.error_reported = True
-
-    def _blob_rect(self, blob):
-        try:
-            if len(blob) >= 5:
-                return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
-        except Exception:
-            pass
-        try:
-            return int(blob.x()), int(blob.y()), int(blob.w()), int(blob.h())
-        except Exception:
-            return int(blob[0]), int(blob[1]), int(blob[2]), int(blob[3])
-
-    def _blob_area(self, blob, w, h):
-        try:
-            if len(blob) >= 5:
-                return int(blob[4])
-        except Exception:
-            pass
-        try:
-            return int(blob.pixels())
-        except Exception:
-            return int(w * h)
-
-    def _estimate_angle(self, points):
-        if len(points) < 2:
-            return 0
-        top = points[0]
-        bottom = points[-1]
-        dx = bottom[0] - top[0]
-        dy = bottom[1] - top[1]
-        if dy == 0:
-            return 0
-        # Small-angle approximation is enough for steering and avoids extra math deps.
-        angle = int(dx * 57 / dy)
-        return clamp(angle, -60, 60)
-
-    def _smooth(self, result):
-        if self.last is None or not self.last["seen"]:
-            return result
-        a = LINE_SMOOTH_ALPHA
-        b = 1.0 - LINE_SMOOTH_ALPHA
-        result["err_x"] = int(self.last["err_x"] * b + result["err_x"] * a)
-        result["angle"] = int(self.last["angle"] * b + result["angle"] * a)
-        result["cx"] = int(self.last["cx"] * b + result["cx"] * a)
-        result["cy"] = int(self.last["cy"] * b + result["cy"] * a)
-        result["width"] = int(self.last["width"] * b + result["width"] * a)
-        result["area"] = int(self.last["area"] * b + result["area"] * a)
-        return result
 
 
 class UartBridge:
@@ -721,10 +647,8 @@ def parse_command(line, current_target):
 
     if cmd in ("A", "AUTO", "T0", "TARGET0", "TARGET,0"):
         return 0, 1
-
     if cmd in ("R", "RESET", "C", "CLEAR"):
         return current_target, 2
-
     if cmd.startswith("TARGET,"):
         num = cmd[7:]
     elif cmd.startswith("TARGET"):
@@ -745,32 +669,23 @@ def parse_command(line, current_target):
     return current_target, 0
 
 
-def result_to_candidates(res, labels):
+def det_boxes_to_candidates(det_boxes, labels):
     candidates = []
-    if res is None:
+    if not det_boxes:
         return candidates
 
-    boxes = res.get("boxes", [])
-    scores = res.get("scores", [])
-    idxs = res.get("idx", [])
-    try:
-        count = len(boxes)
-    except Exception:
-        count = 0
+    min_area = int(CAM_WIDTH * CAM_HEIGHT * MIN_BOX_AREA_RATIO)
+    center_x = CAM_WIDTH // 2
+    center_y = CAM_HEIGHT // 2
 
-    min_area = int(RGB888P_SIZE[0] * RGB888P_SIZE[1] * MIN_BOX_AREA_RATIO)
-    center_x = RGB888P_SIZE[0] // 2
-    center_y = RGB888P_SIZE[1] // 2
-
-    for i in range(count):
+    for det in det_boxes:
         try:
-            cls_idx = int(idxs[i])
-            score = float(scores[i])
-            box = boxes[i]
-            x1 = int(box[0])
-            y1 = int(box[1])
-            x2 = int(box[2])
-            y2 = int(box[3])
+            cls_idx = int(det[0])
+            score = float(det[1])
+            x1 = int(det[2])
+            y1 = int(det[3])
+            x2 = int(det[4])
+            y2 = int(det[5])
         except Exception:
             continue
 
@@ -779,10 +694,10 @@ def result_to_candidates(res, labels):
         if score < SELECT_MIN_SCORE:
             continue
 
-        x1 = clamp(x1, 0, RGB888P_SIZE[0] - 1)
-        y1 = clamp(y1, 0, RGB888P_SIZE[1] - 1)
-        x2 = clamp(x2, 0, RGB888P_SIZE[0] - 1)
-        y2 = clamp(y2, 0, RGB888P_SIZE[1] - 1)
+        x1 = int(clip(x1, 0, CAM_WIDTH - 1))
+        y1 = int(clip(y1, 0, CAM_HEIGHT - 1))
+        x2 = int(clip(x2, 0, CAM_WIDTH - 1))
+        y2 = int(clip(y2, 0, CAM_HEIGHT - 1))
         w = x2 - x1
         h = y2 - y1
         if w <= 1 or h <= 1:
@@ -799,8 +714,8 @@ def result_to_candidates(res, labels):
         err_x = cx - center_x
         err_y = cy - center_y
 
-        norm_area = float(area) / float(RGB888P_SIZE[0] * RGB888P_SIZE[1])
-        norm_center = abs(float(err_x)) / float(center_x)
+        norm_area = float(area) / float(CAM_WIDTH * CAM_HEIGHT)
+        norm_center = abs(float(err_x)) / float(max(1, center_x))
         rank = score * 1000.0 + min(norm_area * 900.0, 260.0) - norm_center * 140.0
 
         candidates.append({
@@ -848,8 +763,8 @@ def build_payload(frame_id, target_id, candidate, locked, hits, fps):
     if candidate is None:
         return "MV,%d,0,%d,0,0,0,0,0,0,0,0,0,0,0,%d" % (frame_id, target_id, fps)
 
-    center_tol = int(RGB888P_SIZE[0] * CENTER_TOLERANCE_RATIO)
-    arrive_h = int(RGB888P_SIZE[1] * ARRIVE_BOX_HEIGHT_RATIO)
+    center_tol = int(CAM_WIDTH * CENTER_TOLERANCE_RATIO)
+    arrive_h = int(CAM_HEIGHT * ARRIVE_BOX_HEIGHT_RATIO)
     arrived = locked and abs(candidate["err_x"]) <= center_tol and candidate["h"] >= arrive_h
     state = 3 if arrived else (2 if locked else 1)
     score1000 = int(candidate["score"] * 1000)
@@ -875,257 +790,243 @@ def build_payload(frame_id, target_id, candidate, locked, hits, fps):
 
 
 def build_line_payload(frame_id, line_result, fps):
-    if line_result is None or not line_result["seen"]:
+    if line_result is None or not line_result.valid:
         return "LN,%d,0,0,0,0,0,0,%d" % (frame_id, fps)
+    err_px = int(line_result.offset * (CAM_WIDTH // 2) / OFFSET_FULL_SCALE)
     return "LN,%d,1,%d,%d,%d,%d,%d,%d" % (
         frame_id,
-        line_result["err_x"],
-        line_result["angle"],
-        line_result["cx"],
-        line_result["width"],
-        line_result["area"],
+        err_px,
+        line_result.angle,
+        line_result.cx,
+        line_result.width,
+        line_result.area,
         fps,
     )
 
 
-def source_size_from_line(line_result):
-    if line_result is not None and "frame_w" in line_result and "frame_h" in line_result:
-        return line_result["frame_w"], line_result["frame_h"]
-    return RGB888P_SIZE[0], RGB888P_SIZE[1]
+def draw_text(img, x, y, msg, color=WHITE, size=16):
+    if hasattr(img, "draw_string_advanced"):
+        try:
+            img.draw_string_advanced(int(x), int(y), int(size), str(msg), color=color)
+            return
+        except Exception:
+            pass
+    img.draw_string(int(x), int(y), str(msg), color=color)
 
 
-def scaled_rect(candidate, display_size):
-    dw = display_size[0]
-    dh = display_size[1]
-    rw = RGB888P_SIZE[0]
-    rh = RGB888P_SIZE[1]
-    x = int(candidate["x1"] * dw // rw)
-    y = int(candidate["y1"] * dh // rh)
-    w = int(candidate["w"] * dw // rw)
-    h = int(candidate["h"] * dh // rh)
-    return x, y, w, h
+def draw_line_result(img, result, fps):
+    w = img.width()
+    h = img.height()
+    img.draw_line(w // 2, 0, w // 2, h, color=GRAY, thickness=1)
+    for cx, cy, _bw, roi in result.bands:
+        img.draw_rectangle(roi[0], roi[1], roi[2], roi[3], color=YELLOW, thickness=1)
+        if cx is not None:
+            img.draw_cross(int(cx), int(cy), color=GREEN, size=6, thickness=2)
+    if result.valid:
+        img.draw_line(w // 2, h - 1, int(result.cx), int(result.cy), color=GREEN, thickness=2)
+        draw_text(img, 2, 2, "LINE off:%d a:%d q:%d fps:%d" % (
+            result.offset,
+            result.angle,
+            result.quality,
+            int(fps),
+        ), GREEN, 15)
+    else:
+        draw_text(img, 2, 2, "LINE LOST lost:%d fps:%d" % (result.lost_frames, int(fps)), RED, 15)
 
 
-def scale_xy(x, y, display_size, source_size=None):
-    if source_size is None:
-        source_size = RGB888P_SIZE
-    return int(x * display_size[0] // source_size[0]), int(y * display_size[1] // source_size[1])
-
-
-def scale_rect_xywh(rect, display_size, source_size=None):
-    x, y, w, h = rect
-    if source_size is None:
-        source_size = RGB888P_SIZE
-    sx, sy = scale_xy(x, y, display_size, source_size)
-    sw = int(w * display_size[0] // source_size[0])
-    sh = int(h * display_size[1] // source_size[1])
-    return sx, sy, sw, sh
-
-
-def draw_candidate(draw_img, candidate, display_size, selected_id, locked):
-    x, y, w, h = scaled_rect(candidate, display_size)
-    is_selected = selected_id == candidate["drug_id"]
-    color = COLOR_TARGET if is_selected else COLOR_NORMAL
-    thickness = 4 if is_selected else 2
-    if locked and is_selected:
-        color = COLOR_LOCKED
-        thickness = 5
-
-    draw_img.draw_rectangle(x, y, w, h, color=color, thickness=thickness)
-    score100 = int(candidate["score"] * 100)
-    text = "%s %d%%" % (candidate["label"], score100)
-    ty = y - 28
-    if ty < 0:
-        ty = y + 2
-    draw_img.draw_string_advanced(x, ty, 22, text, color=color)
-
-
-def draw_line_overlay(draw_img, line_result, display_size):
-    if line_result is None:
-        return
-    source_size = source_size_from_line(line_result)
-
-    if DRAW_LINE_ROIS:
-        for roi_def in line_result["rois"]:
-            x, y, w, h = scale_rect_xywh(roi_def["rect"], display_size, source_size)
-            draw_img.draw_rectangle(x, y, w, h, color=COLOR_LINE_ROI, thickness=1)
-
-    if not line_result["seen"]:
-        text = "LINE LOST b:%d r:%d/%d" % (
-            line_result.get("blob_hits", 0),
-            line_result.get("red_hits", 0),
-            line_result.get("sample_count", 0),
-        )
-        draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_WARN)
-        return
-
-    lx, ly = scale_xy(line_result["cx"], line_result["cy"], display_size, source_size)
-    draw_img.draw_circle(lx, ly, 7, color=COLOR_LINE, fill=True)
-    draw_img.draw_line(display_size[0] // 2, display_size[1], lx, ly, color=COLOR_LINE, thickness=3)
-
-    for point in line_result["points"]:
-        px, py = scale_xy(point[0], point[1], display_size, source_size)
-        draw_img.draw_circle(px, py, 5, color=COLOR_LINE, fill=True)
-
-    text = "LINE ex:%d ang:%d b:%d r:%d/%d" % (
-        line_result["err_x"],
-        line_result["angle"],
-        line_result.get("blob_hits", 0),
-        line_result.get("red_hits", 0),
-        line_result.get("sample_count", 0),
-    )
-    draw_img.draw_string_advanced(8, display_size[1] - 30, 22, text, color=COLOR_LINE)
-
-
-def draw_overlay(draw_img, candidates, selected, target_id, locked, hits, fps, display_size, line_result):
-    draw_img.clear()
-    dw = display_size[0]
-    dh = display_size[1]
-    cx = dw // 2
-    center_tol = int(dw * CENTER_TOLERANCE_RATIO)
-
-    draw_img.draw_line(cx, 0, cx, dh, color=COLOR_GUIDE, thickness=1)
-    draw_img.draw_line(cx - center_tol, dh - 70, cx - center_tol, dh, color=COLOR_GUIDE, thickness=2)
-    draw_img.draw_line(cx + center_tol, dh - 70, cx + center_tol, dh, color=COLOR_GUIDE, thickness=2)
-    draw_line_overlay(draw_img, line_result, display_size)
-
+def draw_digit_result(img, candidates, selected, target_id, locked, hits):
     selected_id = -1
     if selected is not None:
         selected_id = selected["drug_id"]
 
     for cand in candidates:
-        draw_candidate(draw_img, cand, display_size, selected_id, locked)
+        color = MAGENTA
+        thickness = 2
+        if cand["drug_id"] == selected_id:
+            color = GREEN if locked else CYAN
+            thickness = 3
+        img.draw_rectangle(cand["x1"], cand["y1"], cand["w"], cand["h"], color=color, thickness=thickness)
+        draw_text(img, cand["x1"], max(18, cand["y1"]) - 18, "%s %d" % (
+            cand["label"],
+            int(cand["score"] * 100),
+        ), color, 15)
 
+    y = 20
     if selected is None:
-        state_text = "T:%d SEARCH fps:%d" % (target_id, fps)
-        draw_img.draw_string_advanced(8, 6, 24, state_text, color=COLOR_WARN)
+        draw_text(img, 2, y, "DIGIT T:%d SEARCH" % target_id, YELLOW, 15)
         return
 
-    center_ok = "OK" if abs(selected["err_x"]) <= int(RGB888P_SIZE[0] * CENTER_TOLERANCE_RATIO) else "ALIGN"
     lock_text = "LOCK" if locked else "SEEN"
     target_text = "AUTO" if target_id == 0 else str(target_id)
-    state_text = "T:%s %s id:%d s:%d ex:%d %s fps:%d" % (
+    draw_text(img, 2, y, "DIGIT T:%s %s id:%d ex:%d h:%d %d/%d" % (
         target_text,
         lock_text,
         selected["drug_id"],
-        int(selected["score"] * 100),
         selected["err_x"],
-        center_ok,
-        fps,
-    )
-    draw_img.draw_string_advanced(8, 6, 24, state_text, color=COLOR_TEXT)
+        selected["h"],
+        hits,
+        HISTORY_SIZE,
+    ), WHITE, 15)
 
-    if locked:
-        draw_img.draw_string_advanced(8, 36, 22, "stable:%d/%d dist:%dmm" % (
-            hits,
-            HISTORY_SIZE,
-            estimate_distance(selected),
-        ), color=COLOR_LOCKED)
+
+def init_camera():
+    sensor = Sensor(width=CAM_WIDTH, height=CAM_HEIGHT)
+    sensor.reset()
+    sensor.set_framesize(width=CAM_WIDTH, height=CAM_HEIGHT)
+    sensor.set_pixformat(Sensor.RGB565)
+    try:
+        if HMIRROR and hasattr(sensor, "set_hmirror"):
+            sensor.set_hmirror(1)
+        if VFLIP and hasattr(sensor, "set_vflip"):
+            sensor.set_vflip(1)
+    except Exception as exc:
+        print("mirror/flip skipped:", exc)
+    return sensor
+
+
+def init_display():
+    if not SHOW_UI:
+        return None
+    mode = DISPLAY_MODE.lower()
+    if mode == "lcd":
+        try:
+            Display.init(Display.ST7701, width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT, to_ide=True)
+            return Display
+        except Exception as exc:
+            print("LCD display init failed, fallback to VIRT:", exc)
+    Display.init(Display.VIRT, width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT, to_ide=True)
+    return Display
+
+
+def show_image(display, img):
+    if display is None:
+        return
+    x = max(0, (DISPLAY_WIDTH - img.width()) // 2)
+    y = max(0, (DISPLAY_HEIGHT - img.height()) // 2)
+    try:
+        display.show_image(img, x=x, y=y)
+    except TypeError:
+        display.show_image(img)
 
 
 def main():
-    deploy_conf, config_path = load_deploy_config()
-    labels = deploy_conf["categories"]
-    model_type = deploy_conf["model_type"]
-    anchors = flatten_anchors(deploy_conf, model_type)
-    kmodel_path = resolve_model_path(deploy_conf["kmodel_path"])
-    model_input_size = deploy_conf["img_size"]
-
-    confidence_threshold = deploy_conf["confidence_threshold"]
-    nms_threshold = deploy_conf["nms_threshold"]
-    if CONFIDENCE_THRESHOLD_OVERRIDE is not None:
-        confidence_threshold = CONFIDENCE_THRESHOLD_OVERRIDE
-    if NMS_THRESHOLD_OVERRIDE is not None:
-        nms_threshold = NMS_THRESHOLD_OVERRIDE
-
-    nms_option = deploy_conf.get("nms_option", False)
-
-    print("Loaded config:", config_path)
-    print("Model:", kmodel_path)
-    print("Labels:", labels)
-    print("Model type:", model_type)
-    print("Line mode:", "disabled" if not ENABLE_LINE_TRACK else "pipeline frame weighted ROI find_blobs")
-
-    bridge = UartBridge()
-    stabilizer = TargetStabilizer()
-    line_tracker = LineTracker(RGB888P_SIZE)
-    fps_meter = FpsMeter()
-    runtime_target = DEFAULT_TARGET_ID
-    frame_id = 0
-
-    pl = None
-    det_app = None
+    sensor = None
+    display = None
+    detector = None
     try:
-        pl = PipeLine(rgb888p_size=RGB888P_SIZE, display_mode=DISPLAY_MODE, display_size=DISPLAY_SIZE)
-        pl.create(sensor_id=SENSOR_ID, hmirror=HMIRROR, vflip=VFLIP, fps=CAMERA_FPS)
-        display_size = pl.get_display_size()
+        deploy_conf = None
+        config_path = None
+        labels = []
+        if ENABLE_DIGIT_DETECT:
+            try:
+                deploy_conf, config_path = load_deploy_config()
+                labels = deploy_conf["categories"]
+                print("Loaded config:", config_path)
+            except Exception as exc:
+                print("Digit config load failed, line only:", exc)
+                print_exception(exc)
 
-        det_app = DetectionApp(
-            "video",
-            kmodel_path,
-            labels,
-            model_input_size,
-            anchors,
-            model_type,
-            confidence_threshold,
-            nms_threshold,
-            RGB888P_SIZE,
-            display_size,
-            debug_mode=DEBUG_MODE,
-        )
-        det_app.nms_option = nms_option
-        det_app.config_preprocess()
+        sensor = init_camera()
+        display = init_display()
+        MediaManager.init()
+        sensor.run()
 
+        if ENABLE_DIGIT_DETECT and deploy_conf is not None:
+            try:
+                detector = SnapshotAnchorDetector(deploy_conf)
+            except Exception as exc:
+                print("Digit detector disabled:", exc)
+                print_exception(exc)
+                detector = None
+
+        bridge = UartBridge()
+        tracker = LineTracker()
+        stabilizer = TargetStabilizer()
+        runtime_target = DEFAULT_TARGET_ID
+
+        frame_id = 0
+        fps = 0.0
+        last_t = ticks_ms()
+        candidates = []
+        selected = None
+        locked = 0
+        hits = 0
+
+        print("combined started: sensor RGB565 snapshot + line + digit")
         while True:
-            with ScopedTiming("total", PROFILE_TOTAL):
-                for line in bridge.read_commands():
-                    new_target, accepted = parse_command(line, runtime_target)
-                    if accepted:
-                        runtime_target = new_target
-                        stabilizer.reset()
-                        if accepted == 2:
-                            print("Vision lock reset")
-                        else:
-                            print("Target set:", runtime_target)
+            check_exitpoint()
+            for line in bridge.read_commands():
+                new_target, accepted = parse_command(line, runtime_target)
+                if accepted:
+                    runtime_target = new_target
+                    stabilizer.reset()
+                    selected = None
+                    locked = 0
+                    hits = 0
+                    if accepted == 2:
+                        print("Vision lock reset")
+                    else:
+                        print("Target set:", runtime_target)
 
-                frame_id += 1
-                fps = fps_meter.update()
+            img = sensor.snapshot()
+            if img is None:
+                continue
 
-                img = pl.get_frame()
-                line_result = None
-                if ENABLE_LINE_TRACK and frame_id % LINE_DETECT_EVERY_N_FRAMES == 0:
-                    line_result = line_tracker.update(pl.cur_frame)
-                else:
-                    line_result = line_tracker.last
-                res = det_app.run(img)
+            frame_id += 1
+            now = ticks_ms()
+            dt = ticks_diff(now, last_t)
+            last_t = now
+            if dt > 0:
+                fps = 0.90 * fps + 0.10 * (1000.0 / dt)
 
-                candidates = result_to_candidates(res, labels)
-                picked = pick_candidate(candidates, runtime_target)
-                selected, locked, hits = stabilizer.update(picked)
+            line_result = tracker.process(img)
 
-                if frame_id % SEND_EVERY_N_FRAMES == 0:
-                    payload = build_payload(frame_id, runtime_target, selected, locked, hits, fps)
-                    bridge.write_packet(payload)
-                    line_payload = build_line_payload(frame_id, line_result, fps)
-                    bridge.write_packet(line_payload)
+            if detector is not None and (frame_id % DIGIT_DETECT_EVERY_N_FRAMES == 0 or selected is None):
+                try:
+                    det_boxes = detector.detect(img)
+                    candidates = det_boxes_to_candidates(det_boxes, labels)
+                    picked = pick_candidate(candidates, runtime_target)
+                    selected, locked, hits = stabilizer.update(picked)
+                except Exception as exc:
+                    print("digit detect failed:", exc)
+                    print_exception(exc)
+                    candidates = []
+                    selected, locked, hits = stabilizer.update(None)
 
-                draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
-                pl.show_image()
+            if frame_id % SEND_EVERY_N_FRAMES == 0:
+                bridge.write_packet(build_payload(frame_id, runtime_target, selected, locked, hits, int(fps)))
+                bridge.write_packet(build_line_payload(frame_id, line_result, int(fps)))
+
+            if SHOW_UI:
+                draw_line_result(img, line_result, fps)
+                draw_digit_result(img, candidates, selected, runtime_target, locked, hits)
+                show_image(display, img)
+
+            if frame_id % 20 == 0:
                 gc.collect()
 
     except KeyboardInterrupt:
         print("Stopped by user")
     finally:
         try:
-            if det_app is not None:
-                det_app.deinit()
-        except Exception as e:
-            print("det_app deinit failed:", e)
+            if detector is not None:
+                detector.deinit()
+        except Exception:
+            pass
         try:
-            if pl is not None:
-                pl.destroy()
-        except Exception as e:
-            print("pipeline destroy failed:", e)
+            if sensor is not None:
+                sensor.stop()
+        except Exception:
+            pass
+        try:
+            if SHOW_UI:
+                Display.deinit()
+        except Exception:
+            pass
+        try:
+            MediaManager.deinit()
+        except Exception:
+            pass
 
 
 main()
