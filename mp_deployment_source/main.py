@@ -45,10 +45,10 @@ DEFAULT_TARGET_ID = 0
 DETECT_EVERY_N_FRAMES = 1
 SELECT_MIN_SCORE = 0.45
 MIN_BOX_AREA_RATIO = 0.00020
-HISTORY_SIZE = 7
-LOCK_MIN_HITS = 4
+HISTORY_SIZE = 5
+LOCK_MIN_HITS = 3
 LOST_RESET_FRAMES = 5
-SMOOTH_ALPHA = 0.62
+SMOOTH_ALPHA = 0.78
 
 # Delivery decision. The car should stop when state == 3.
 CENTER_TOLERANCE_RATIO = 0.045
@@ -89,7 +89,8 @@ LINE_ROI_BANDS = [
     (0.76, 0.98, 1.00),
     (0.52, 0.70, 0.55),
 ]
-LINE_SMOOTH_ALPHA = 1.00
+LINE_SMOOTH_ALPHA = 0.82
+LINE_DEADBAND_PX = 2
 LINE_LOST_RESET_FRAMES = 5
 DRAW_LINE_ROIS = False
 
@@ -101,7 +102,9 @@ UART_TX_PIN = 11
 UART_RX_PIN = 12
 LINE_SEND_EVERY_N_FRAMES = 1
 MV_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
-DISPLAY_EVERY_N_FRAMES = 1
+MULTI_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
+MULTI_MAX_CANDIDATES = 4
+DISPLAY_EVERY_N_FRAMES = 2
 PRINT_PROTOCOL_WHEN_NO_UART = False
 GC_EVERY_N_FRAMES = 20
 FAST_DISPLAY = True
@@ -773,8 +776,20 @@ class LineTracker:
     def _smooth(self, result):
         if self.last is None or not self.last["seen"]:
             return result
+        delta = abs(result["err_x"] - self.last["err_x"])
+        if delta <= LINE_DEADBAND_PX:
+            result["err_x"] = self.last["err_x"]
+            result["cx"] = self.last["cx"]
+            result["angle"] = int(self.last["angle"] * 0.75 + result["angle"] * 0.25)
+            return result
+
         a = LINE_SMOOTH_ALPHA
-        b = 1.0 - LINE_SMOOTH_ALPHA
+        if delta > self.frame_w // 10:
+            a = 1.0
+        if a >= 1.0:
+            b = 0.0
+        else:
+            b = 1.0 - a
         result["err_x"] = int(self.last["err_x"] * b + result["err_x"] * a)
         result["angle"] = int(self.last["angle"] * b + result["angle"] * a)
         result["cx"] = int(self.last["cx"] * b + result["cx"] * a)
@@ -1001,7 +1016,7 @@ def result_to_candidates(res, labels):
     return candidates
 
 
-def pick_candidate(candidates, target_id):
+def pick_candidate(candidates, target_id, previous=None):
     best = None
     best_rank = -1000000.0
     for cand in candidates:
@@ -1010,6 +1025,12 @@ def pick_candidate(candidates, target_id):
         rank = cand["rank"]
         if target_id > 0:
             rank += 420.0
+        if previous is not None:
+            if cand["drug_id"] == previous["drug_id"]:
+                rank += 180.0
+                dx = abs(cand["cx"] - previous["cx"])
+                dy = abs(cand["cy"] - previous["cy"])
+                rank += max(0.0, 120.0 - float(dx + dy) * 0.6)
         if rank > best_rank:
             best_rank = rank
             best = cand
@@ -1103,6 +1124,24 @@ def build_line_payload(frame_id, line_result, fps):
         line_result["area"],
         fps,
     )
+
+
+def build_multi_payload(frame_id, candidates, fps):
+    ordered = sorted(candidates, key=lambda item: item["rank"], reverse=True)
+    count = min(MULTI_MAX_CANDIDATES, len(ordered))
+    parts = ["ML", str(frame_id), str(count)]
+    for i in range(count):
+        cand = ordered[i]
+        parts.extend((
+            str(cand["drug_id"]),
+            str(int(cand["score"] * 1000)),
+            str(cand["cx"]),
+            str(cand["cy"]),
+            str(cand["w"]),
+            str(cand["h"]),
+        ))
+    parts.append(str(fps))
+    return ",".join(parts)
 
 
 def source_size_from_line(line_result):
@@ -1342,12 +1381,15 @@ def main():
                 if frame_id == 1 or frame_id % DETECT_EVERY_N_FRAMES == 0:
                     res = det_app.run(img)
                     candidates = result_to_candidates(res, labels)
-                    picked = pick_candidate(candidates, runtime_target)
+                    picked = pick_candidate(candidates, runtime_target, selected)
                     selected, locked, hits = stabilizer.update(picked)
 
                 if frame_id == 1 or frame_id % MV_SEND_EVERY_N_FRAMES == 0:
                     payload = build_payload(frame_id, runtime_target, selected, locked, hits, fps)
                     bridge.write_packet(payload)
+                if frame_id == 1 or frame_id % MULTI_SEND_EVERY_N_FRAMES == 0:
+                    multi_payload = build_multi_payload(frame_id, candidates, fps)
+                    bridge.write_packet(multi_payload)
 
                 if frame_id == 1 or frame_id % DISPLAY_EVERY_N_FRAMES == 0:
                     draw_overlay(pl.osd_img, candidates, selected, runtime_target, locked, hits, fps, display_size, line_result)
