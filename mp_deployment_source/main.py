@@ -19,9 +19,10 @@ from media.media import MediaManager
 
 ROOT_PATH = "/sdcard/mp_deployment_source/"
 
-# Keep this equal to the line-debug program that already worked.
-CAM_WIDTH = 480
-CAM_HEIGHT = 272
+# 480x272 can be center-cropped by some K230 sensor modes and look too narrow.
+# 640x360 keeps the same 16:9-ish view with a wider field than the line debug mode.
+CAM_WIDTH = 640
+CAM_HEIGHT = 360
 
 # Use "virt" for CanMV IDE preview. Use "lcd" on the real ST7701 screen.
 DISPLAY_MODE = "virt"
