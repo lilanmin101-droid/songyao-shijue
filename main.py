@@ -68,12 +68,16 @@ LINE_MIN_DENSITY = 0.12
 LINE_CENTER_PENALTY = 0.18
 LINE_MEMORY_PENALTY = 0.45
 LINE_USE_SPARSE_RGB_FALLBACK = True
-LINE_SPARSE_STEP_X = 40
-LINE_SPARSE_STEP_Y = 20
-LINE_SPARSE_MIN_HITS = 1
-LINE_RED_MIN = 80
-LINE_RED_DOMINANCE = 0
-LINE_ACCEPT_BGR_RED = True
+LINE_SPARSE_STEP_X = 18
+LINE_SPARSE_STEP_Y = 14
+LINE_SPARSE_MIN_HITS = 2
+LINE_RED_MIN = 90
+LINE_RED_DOMINANCE = 38
+LINE_RED_MAX_GREEN = 145
+LINE_RED_MAX_BLUE = 170
+LINE_RED_CLUSTER_GAP = 42
+LINE_RED_MAX_CLUSTER_WIDTH_RATIO = 0.22
+LINE_ACCEPT_BGR_RED = False
 LINE_ROI_BANDS = [
     (0.78, 0.98, 1.00),
     (0.54, 0.72, 0.65),
@@ -366,7 +370,7 @@ class LineTracker:
             else:
                 blob = None
             if blob is None and LINE_USE_SPARSE_RGB_FALLBACK:
-                blob = self._sparse_red_blob(img_obj, rect)
+                blob = self._sparse_red_blob(img_obj, rect, self.frame_w * 0.5)
             if blob is None:
                 continue
             x, y, w, h = self._blob_rect(blob)
@@ -425,17 +429,11 @@ class LineTracker:
         except Exception:
             return False
 
-    def _sparse_red_blob(self, img_obj, rect):
+    def _sparse_red_blob(self, img_obj, rect, frame_center_x):
         x0, y0, rw, rh = rect
         x1 = x0 + rw
         y1 = y0 + rh
-        hits = 0
-        sum_x = 0
-        sum_y = 0
-        min_x = x1
-        min_y = y1
-        max_x = x0
-        max_y = y0
+        hits = []
 
         for y in range(y0, y1, LINE_SPARSE_STEP_Y):
             for x in range(x0, x1, LINE_SPARSE_STEP_X):
@@ -446,27 +444,84 @@ class LineTracker:
                 r, g, b = pixel
                 if self._is_red_pixel(r, g, b):
                     self.debug_red_hits += 1
-                    hits += 1
-                    sum_x += x
-                    sum_y += y
-                    if x < min_x:
-                        min_x = x
-                    if y < min_y:
-                        min_y = y
-                    if x > max_x:
-                        max_x = x
-                    if y > max_y:
-                        max_y = y
+                    hits.append((x, y))
 
-        if hits < LINE_SPARSE_MIN_HITS:
+        if len(hits) < LINE_SPARSE_MIN_HITS:
             return None
 
-        cx = int(sum_x / hits)
-        cy = int(sum_y / hits)
+        cluster = self._best_red_cluster(hits, rect, frame_center_x)
+        if cluster is None:
+            return None
+        min_x, min_y, max_x, max_y, sum_x, sum_y, count = cluster
+
+        cx = int(sum_x / count)
+        cy = int(sum_y / count)
         w = max(LINE_SPARSE_STEP_X, max_x - min_x + LINE_SPARSE_STEP_X)
         h = max(LINE_SPARSE_STEP_Y, max_y - min_y + LINE_SPARSE_STEP_Y)
-        area = hits * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
+        area = count * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
         return (cx - w // 2, cy - h // 2, w, h, area)
+
+    def _best_red_cluster(self, hits, rect, frame_center_x=None):
+        x0, _y0, rw, _rh = rect
+        predicted_x = x0 + rw * 0.5
+        if frame_center_x is not None:
+            predicted_x = frame_center_x + self.last_offset / 100.0 * frame_center_x
+            predicted_x = clamp(predicted_x, x0, x0 + rw)
+
+        bins = {}
+        for px, py in hits:
+            stat = bins.get(px)
+            if stat is None:
+                bins[px] = [1, py, py, px, py]
+            else:
+                stat[0] += 1
+                if py < stat[1]:
+                    stat[1] = py
+                if py > stat[2]:
+                    stat[2] = py
+                stat[3] += px
+                stat[4] += py
+
+        best_x = None
+        best_score = -1000000
+        for bx in bins:
+            stat = bins[bx]
+            count = stat[0]
+            if count < LINE_SPARSE_MIN_HITS:
+                continue
+            height = stat[2] - stat[1] + LINE_SPARSE_STEP_Y
+            memory_penalty = abs(bx - predicted_x) * 0.20
+            score = count * 120 + height * 2 - memory_penalty
+            if score > best_score:
+                best_score = score
+                best_x = bx
+
+        if best_x is None:
+            return None
+
+        selected = []
+        min_col_hits = max(1, bins[best_x][0] // 3)
+        for px, py in hits:
+            stat = bins.get(px)
+            if abs(px - best_x) <= LINE_RED_CLUSTER_GAP and stat is not None and stat[0] >= min_col_hits:
+                selected.append((px, py))
+
+        if len(selected) < LINE_SPARSE_MIN_HITS:
+            return None
+
+        min_x = min(p[0] for p in selected)
+        max_x = max(p[0] for p in selected)
+        min_y = min(p[1] for p in selected)
+        max_y = max(p[1] for p in selected)
+        width = max_x - min_x + LINE_SPARSE_STEP_X
+        if width > max(LINE_SPARSE_STEP_X * 3, int(rw * LINE_RED_MAX_CLUSTER_WIDTH_RATIO)):
+            return None
+        sum_x = 0
+        sum_y = 0
+        for px, py in selected:
+            sum_x += px
+            sum_y += py
+        return (min_x, min_y, max_x, max_y, sum_x, sum_y, len(selected))
 
     def _get_rgb_pixel(self, img_obj, x, y):
         try:
@@ -518,6 +573,10 @@ class LineTracker:
 
     def _is_red_order(self, r, g, b):
         if r < LINE_RED_MIN:
+            return False
+        if g > LINE_RED_MAX_GREEN:
+            return False
+        if b > LINE_RED_MAX_BLUE:
             return False
         if r < g + LINE_RED_DOMINANCE:
             return False
