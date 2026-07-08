@@ -42,7 +42,7 @@ VFLIP = None
 DEFAULT_TARGET_ID = 0
 
 # Selection and lock tuning.
-DETECT_EVERY_N_FRAMES = 5
+DETECT_EVERY_N_FRAMES = 10
 SELECT_MIN_SCORE = 0.45
 MIN_BOX_AREA_RATIO = 0.00020
 HISTORY_SIZE = 7
@@ -70,7 +70,9 @@ LINE_MIN_DENSITY = 0.12
 LINE_CENTER_PENALTY = 0.18
 LINE_MEMORY_PENALTY = 0.45
 LINE_USE_SPARSE_RGB_FALLBACK = True
-LINE_SPARSE_STEP_X = 24
+LINE_FAST_ROW_SCAN = True
+LINE_FAST_ROWS_PER_BAND = 3
+LINE_SPARSE_STEP_X = 20
 LINE_SPARSE_STEP_Y = 18
 LINE_SPARSE_MIN_HITS = 2
 LINE_RED_MIN = 90
@@ -96,8 +98,8 @@ UART_TX_PIN = 11
 UART_RX_PIN = 12
 LINE_SEND_EVERY_N_FRAMES = 1
 MV_SEND_EVERY_N_FRAMES = DETECT_EVERY_N_FRAMES
-DISPLAY_EVERY_N_FRAMES = 2
-PRINT_PROTOCOL_WHEN_NO_UART = True
+DISPLAY_EVERY_N_FRAMES = 1
+PRINT_PROTOCOL_WHEN_NO_UART = False
 GC_EVERY_N_FRAMES = 20
 
 # If the model is noisy in your venue, raise to 0.48-0.55.
@@ -444,9 +446,11 @@ class LineTracker:
         y1 = y0 + rh
         hits = []
 
-        for y in range(y0, y1, LINE_SPARSE_STEP_Y):
+        layout = self._rgb_layout(img_obj)
+        y_values = self._sample_rows(y0, y1)
+        for y in y_values:
             for x in range(x0, x1, LINE_SPARSE_STEP_X):
-                pixel = self._get_rgb_pixel(img_obj, x, y)
+                pixel = self._get_rgb_pixel_fast(img_obj, layout, x, y)
                 if pixel is None:
                     return None
                 self.debug_sample_count += 1
@@ -470,6 +474,54 @@ class LineTracker:
         area = count * LINE_SPARSE_STEP_X * LINE_SPARSE_STEP_Y
         return (cx - w // 2, cy - h // 2, w, h, area)
 
+    def _sample_rows(self, y0, y1):
+        if not LINE_FAST_ROW_SCAN:
+            return range(y0, y1, LINE_SPARSE_STEP_Y)
+        height = y1 - y0
+        if height <= 1:
+            return (y0,)
+        rows = []
+        count = max(1, LINE_FAST_ROWS_PER_BAND)
+        for i in range(count):
+            y = y0 + int((i + 1) * height / float(count + 1))
+            if y >= y1:
+                y = y1 - 1
+            if y < y0:
+                y = y0
+            rows.append(y)
+        return rows
+
+    def _rgb_layout(self, img_obj):
+        try:
+            shape = img_obj.shape
+            if len(shape) == 4 and shape[0] == 1 and shape[1] == 3:
+                return 1
+            if len(shape) == 4 and shape[0] == 1 and shape[3] == 3:
+                return 2
+            if len(shape) == 3 and shape[0] == 3:
+                return 3
+            if len(shape) == 3 and shape[2] == 3:
+                return 4
+        except Exception:
+            pass
+        return 0
+
+    def _get_rgb_pixel_fast(self, img_obj, layout, x, y):
+        try:
+            if layout == 1:
+                return int(img_obj[0][0][y][x]), int(img_obj[0][1][y][x]), int(img_obj[0][2][y][x])
+            if layout == 2:
+                value = img_obj[0][y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+            if layout == 3:
+                return int(img_obj[0][y][x]), int(img_obj[1][y][x]), int(img_obj[2][y][x])
+            if layout == 4:
+                value = img_obj[y][x]
+                return int(value[0]), int(value[1]), int(value[2])
+        except Exception:
+            return None
+        return self._get_rgb_pixel(img_obj, x, y)
+
     def _best_red_cluster(self, hits, rect, frame_center_x=None):
         x0, _y0, rw, _rh = rect
         predicted_x = x0 + rw * 0.5
@@ -478,10 +530,12 @@ class LineTracker:
             predicted_x = clamp(predicted_x, x0, x0 + rw)
 
         bins = {}
+        bin_w = max(1, LINE_SPARSE_STEP_X)
         for px, py in hits:
-            stat = bins.get(px)
+            bx = int(px // bin_w)
+            stat = bins.get(bx)
             if stat is None:
-                bins[px] = [1, py, py, px, py]
+                bins[bx] = [1, py, py, px, py]
             else:
                 stat[0] += 1
                 if py < stat[1]:
@@ -491,27 +545,31 @@ class LineTracker:
                 stat[3] += px
                 stat[4] += py
 
+        best_key = None
         best_x = None
         best_score = -1000000
-        for bx in bins:
-            stat = bins[bx]
+        for key in bins:
+            stat = bins[key]
             count = stat[0]
-            if count < LINE_SPARSE_MIN_HITS:
+            if count < (1 if LINE_FAST_ROW_SCAN else LINE_SPARSE_MIN_HITS):
                 continue
+            bx = stat[3] / float(count)
             height = stat[2] - stat[1] + LINE_SPARSE_STEP_Y
             memory_penalty = abs(bx - predicted_x) * 0.20
             score = count * 120 + height * 2 - memory_penalty
             if score > best_score:
                 best_score = score
+                best_key = key
                 best_x = bx
 
         if best_x is None:
             return None
 
         selected = []
-        min_col_hits = max(1, bins[best_x][0] // 3)
+        min_col_hits = max(1, bins[best_key][0] // 3)
         for px, py in hits:
-            stat = bins.get(px)
+            key = int(px // bin_w)
+            stat = bins.get(key)
             if abs(px - best_x) <= LINE_RED_CLUSTER_GAP and stat is not None and stat[0] >= min_col_hits:
                 selected.append((px, py))
 
